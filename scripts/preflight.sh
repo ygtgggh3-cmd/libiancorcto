@@ -19,14 +19,15 @@ status=0
 for url in "$MAIN/dists/trixie/Release" \
            "$MAIN/dists/trixie-updates/Release" \
            "$SEC/dists/trixie-security/Release"; do
+    expected=$(basename "$(dirname "$url")")   # trixie | trixie-updates | trixie-security
     if curl -fsSL --retry 3 --max-time 60 -o /tmp/Release "$url"; then
         suite=$(sed -n 's/^Suite: //p' /tmp/Release | head -n1)
         code=$(sed -n 's/^Codename: //p' /tmp/Release | head -n1)
         comps=$(sed -n 's/^Components: //p' /tmp/Release | head -n1)
         echo "OK   $url  (Suite=$suite Codename=$code Components=$comps)"
         echo "- OK \`$url\` (Codename \`$code\`, componentes: $comps)" >> "$SUMMARY"
-        if [ "$code" != "trixie" ]; then
-            echo "ERROR: $url no es de trixie (Codename=$code)"; status=1
+        if [ "$code" != "$expected" ]; then
+            echo "ERROR: $url: se esperaba Codename=$expected y es $code"; status=1
         fi
     else
         echo "ERROR: no responde $url"
