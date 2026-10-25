@@ -1,0 +1,47 @@
+#!/bin/sh
+# LIBIAN TV: sesión mínima. Sin panel ni escritorio: solo gestor de ventanas
+# (xfwm4) y la interfaz de TV. Si la interfaz termina, se vuelve a lanzar.
+export XDG_CURRENT_DESKTOP=XFCE
+export XDG_SESSION_DESKTOP=libian-tv
+export XDG_MENU_PREFIX=xfce-
+
+logger -t libian-tv-session "sesion iniciada" 2>/dev/null || true
+
+# Sin salvapantallas ni apagado de pantalla (es una TV).
+xset s off 2>/dev/null
+xset -dpms 2>/dev/null
+xset s noblank 2>/dev/null
+xsetroot -solid '#05070b' 2>/dev/null
+
+# Servicios mínimos: ajustes de XFCE y gestor de ventanas sin compositor
+# (ahorra RAM y funciona mejor en gráficos antiguos).
+xfsettingsd >/dev/null 2>&1 &
+xfwm4 --compositor=off >/dev/null 2>&1 &
+
+# Audio: si PipeWire no se activó por socket, intenta arrancarlo.
+systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service \
+    >/dev/null 2>&1 || true
+
+fast_failures=0
+while :; do
+    start=$(date +%s)
+    /usr/local/bin/libian-tv
+    rc=$?
+    if [ "$rc" -eq 42 ]; then
+        pkill -u "$(id -u)" -x xfwm4 2>/dev/null
+        pkill -u "$(id -u)" -x xfsettingsd 2>/dev/null
+        exec startxfce4
+    fi
+    now=$(date +%s)
+    if [ $((now - start)) -lt 5 ]; then
+        fast_failures=$((fast_failures + 1))
+    else
+        fast_failures=0
+    fi
+    if [ "$fast_failures" -ge 3 ]; then
+        # La interfaz falla al arrancar: no dejar la pantalla en negro.
+        logger -t libian-tv-session "la interfaz falla; abriendo terminal de rescate"
+        exec xterm -fa Monospace -fs 14 -e "echo 'LIBIAN TV: la interfaz no pudo iniciar.'; echo 'Ejecuta: /usr/local/bin/libian-tv'; exec sh"
+    fi
+    sleep 1
+done

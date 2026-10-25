@@ -1,0 +1,4 @@
+# Swap comprimido en RAM (zram-tools): ayuda mucho con 3 GB de RAM.
+ALGO=lz4
+PERCENT=60
+PRIORITY=100

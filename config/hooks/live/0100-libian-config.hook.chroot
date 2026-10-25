@@ -1,0 +1,32 @@
+#!/bin/sh
+# Configuración final dentro del chroot (se ejecuta durante lb build).
+set -e
+
+chmod 755 /usr/local/bin/libian-tv /usr/local/bin/libian-tv-session \
+          /usr/local/lib/libian/autologin.sh
+
+# Servicio que activa el inicio automático en la interfaz de TV.
+systemctl enable libian-autologin.service
+
+# Arranque gráfico por defecto.
+systemctl set-default graphical.target
+
+# Menos servicios en RAM (equipo antiguo). Ninguno es necesario para una TV.
+for unit in ModemManager.service bluetooth.service apt-daily.timer \
+            apt-daily-upgrade.timer man-db.timer e2scrub_all.timer; do
+    systemctl disable "$unit" 2>/dev/null || true
+done
+
+# zram-tools (si está instalado)
+if [ -f /lib/systemd/system/zramswap.service ] || [ -f /usr/lib/systemd/system/zramswap.service ]; then
+    systemctl enable zramswap.service 2>/dev/null || true
+fi
+
+# Nombre del sistema
+sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="LIBIAN TV (Debian GNU\/Linux 13 trixie)"/' /etc/os-release || true
+
+# Instalador: rotular con el nombre del proyecto (mejor esfuerzo).
+for f in /etc/calamares/branding/*/branding.desc; do
+    [ -f "$f" ] || continue
+    sed -i -E 's/^(\s*(productName|shortProductName|bootloaderEntryName):\s*).*/\1"LIBIAN TV"/' "$f" || true
+done

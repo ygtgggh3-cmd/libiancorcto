@@ -1,0 +1,29 @@
+# ===== OPCIONALES =====
+# Si algún paquete de esta lista no existe en trixie, scripts/preflight.sh lo
+# quita automáticamente y lo avisa en el resumen de la compilación (no falla).
+
+# RAM baja
+zram-tools
+
+# Español
+firefox-esr-l10n-es-mx
+hunspell-es
+
+# Firmware para equipos antiguos (Wi-Fi, red, gráficos Radeon, microcódigo)
+firmware-linux-free
+firmware-misc-nonfree
+firmware-realtek
+firmware-atheros
+firmware-iwlwifi
+firmware-brcm80211
+firmware-amd-graphics
+intel-microcode
+amd64-microcode
+
+# Juegos ligeros
+aisleriot
+pysolfc
+supertux
+
+# YouTube ligero desde mpv/terminal
+yt-dlp

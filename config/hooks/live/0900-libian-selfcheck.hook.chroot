@@ -1,0 +1,31 @@
+#!/bin/sh
+# Autocomprobación: si algo imprescindible falta, la compilación FALLA aquí
+# (mejor que producir una ISO que arranca en pantalla negra).
+set -e
+fail() { echo "SELFCHECK FALLÓ: $*" >&2; exit 1; }
+
+for f in /usr/local/bin/libian-tv /usr/local/bin/libian-tv-session \
+         /usr/local/lib/libian/autologin.sh \
+         /usr/share/xsessions/libian-tv.desktop \
+         /etc/lightdm/lightdm.conf.d/50-libian.conf \
+         /etc/systemd/system/libian-autologin.service; do
+    [ -e "$f" ] || fail "no existe $f"
+done
+for f in /usr/local/bin/libian-tv /usr/local/bin/libian-tv-session /usr/local/lib/libian/autologin.sh; do
+    [ -x "$f" ] || fail "$f no es ejecutable"
+done
+for bin in xfwm4 xfsettingsd startxfce4 lightdm firefox-esr vlc thunar xfce4-terminal \
+           xterm calamares xset xsetroot logger; do
+    command -v "$bin" >/dev/null 2>&1 || fail "falta el programa: $bin"
+done
+
+python3 -m py_compile /usr/local/bin/libian-tv || fail "libian-tv no compila"
+python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk, Gdk, GLib" \
+    || fail "python3-gi / GTK 3 no se pueden importar"
+sh -n /usr/local/bin/libian-tv-session || fail "libian-tv-session tiene errores de sintaxis"
+sh -n /usr/local/lib/libian/autologin.sh || fail "autologin.sh tiene errores de sintaxis"
+desktop-file-validate /usr/share/xsessions/libian-tv.desktop || echo "AVISO: desktop-file-validate reporta advertencias en libian-tv.desktop"
+systemctl is-enabled libian-autologin.service >/dev/null 2>&1 || fail "libian-autologin.service no está habilitado"
+
+rm -rf /usr/local/bin/__pycache__
+echo "SELFCHECK OK"

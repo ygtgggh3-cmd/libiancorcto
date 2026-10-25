@@ -1,0 +1,381 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""LIBIAN TV: interfaz de Smart TV a pantalla completa (GTK 3).
+
+Códigos de salida (los usa /usr/local/bin/libian-tv-session):
+    0  -> la ventana se cerró: la sesión vuelve a lanzar la interfaz
+    42 -> el usuario pidió el escritorio XFCE completo
+"""
+import os
+import shutil
+import subprocess
+import sys
+import syslog
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+EXIT_DESKTOP = 42
+syslog.openlog("libian-tv")
+
+
+def is_live():
+    try:
+        with open("/proc/cmdline", encoding="utf-8") as fh:
+            return "boot=live" in fh.read().split()
+    except OSError:
+        return False
+
+
+def usb_folder():
+    """Carpeta donde se montan los USB (gvfs/udisks), o la carpeta personal."""
+    user = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
+    for base in ("/run/media", "/media"):
+        path = os.path.join(base, user)
+        try:
+            if os.path.isdir(path) and os.listdir(path):
+                return path
+        except OSError:
+            pass
+    return os.path.expanduser("~")
+
+
+# ---------------------------------------------------------------------------
+# Definición del menú.  Cada elemento:
+#   (glifo, título, descripción, color, acción, comando_requerido)
+# Acciones: ("page", nombre) ("cmd", [args]) ("web", url) ("exit", código)
+#           ("power", "poweroff"|"reboot")
+# Los elementos cuyo comando no está instalado se ocultan automáticamente.
+# ---------------------------------------------------------------------------
+def web(title, desc, color, url):
+    return ("▶", title, desc, color, ("web", url), "firefox-esr")
+
+
+PAGES = {
+    "main": ("¿Qué quieres hacer hoy?", [
+        ("▶", "YouTube", "Videos y canales", "red",
+         ("web", "https://www.youtube.com/"), "firefox-esr"),
+        ("▣", "Streaming", "Series y películas", "blue", ("page", "streaming"), None),
+        ("▤", "USB y Videos", "Tus archivos multimedia", "green", ("page", "usb"), None),
+        ("♞", "Juegos", "Para pasar el rato", "purple", ("page", "games"), None),
+        ("▦", "Aplicaciones", "Archivos, terminal y más", "orange", ("page", "apps"), None),
+        ("⚙", "Ajustes", "Red, sonido y pantalla", "slate", ("page", "settings"), None),
+    ]),
+    "streaming": ("Streaming", [
+        web("Netflix", "netflix.com", "red", "https://www.netflix.com/"),
+        web("Prime Video", "primevideo.com", "blue", "https://www.primevideo.com/"),
+        web("Disney+", "disneyplus.com", "indigo", "https://www.disneyplus.com/"),
+        web("Max", "max.com", "purple", "https://www.max.com/"),
+        web("Pluto TV", "Gratis, con canales en vivo", "orange", "https://pluto.tv/"),
+        web("Twitch", "twitch.tv", "violet", "https://www.twitch.tv/"),
+        web("Crunchyroll", "Anime", "amber", "https://www.crunchyroll.com/"),
+        web("YouTube modo TV", "youtube.com/tv (experimental)", "red", "https://www.youtube.com/tv"),
+    ]),
+    "usb": ("USB y Videos", [
+        ("▤", "Explorar USB", "Abrir memorias y discos", "green",
+         ("usb", None), "thunar"),
+        ("▶", "Reproductor VLC", "Videos y música", "orange", ("cmd", ["vlc"]), "vlc"),
+        ("▶", "Reproductor MPV", "Ligero y rápido", "blue",
+         ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
+        ("▦", "Mis videos", "Carpeta Videos", "slate",
+         ("cmd", ["thunar", os.path.expanduser("~/Videos")]), "thunar"),
+    ]),
+    "games": ("Juegos", [
+        ("♠", "Solitarios", "AisleRiot, +80 juegos de cartas", "green",
+         ("cmd", ["sol"]), "sol"),
+        ("♣", "PySolFC", "Colección de solitarios", "blue",
+         ("cmd", ["pysolfc"]), "pysolfc"),
+        ("♞", "SuperTux", "Plataformas estilo Mario", "orange",
+         ("cmd", ["supertux2"]), "supertux2"),
+    ]),
+    "apps": ("Aplicaciones", [
+        ("◎", "Navegador web", "Firefox", "orange", ("cmd", ["firefox-esr"]), "firefox-esr"),
+        ("▤", "Archivos", "Administrador de archivos", "green", ("cmd", ["thunar"]), "thunar"),
+        ("▶", "Reproductor", "VLC", "blue", ("cmd", ["vlc"]), "vlc"),
+        ("▣", "Terminal", "Línea de comandos", "slate",
+         ("cmd", ["xfce4-terminal"]), "xfce4-terminal"),
+        ("⬇", "Instalar LIBIAN TV", "Instalar en el disco duro", "red",
+         ("install", None), "calamares"),
+        ("▦", "Escritorio XFCE", "Escritorio tradicional", "purple",
+         ("exit", EXIT_DESKTOP), None),
+    ]),
+    "settings": ("Ajustes", [
+        ("◉", "Red y Wi-Fi", "Conectarse a internet", "blue",
+         ("cmd", ["nm-connection-editor"]), "nm-connection-editor"),
+        ("♪", "Sonido", "Volumen y salida de audio", "green",
+         ("cmd", ["pavucontrol"]), "pavucontrol"),
+        ("▭", "Pantalla", "Resolución y monitores", "purple",
+         ("cmd", ["xfce4-display-settings"]), "xfce4-display-settings"),
+        ("⌨", "Teclado", "Distribución y atajos", "orange",
+         ("cmd", ["xfce4-keyboard-settings"]), "xfce4-keyboard-settings"),
+        ("⚙", "Todos los ajustes", "Configuración del sistema", "slate",
+         ("cmd", ["xfce4-settings-manager"]), "xfce4-settings-manager"),
+        ("↻", "Reiniciar", "Reiniciar el equipo", "amber", ("power", "reboot"), "systemctl"),
+        ("⏻", "Apagar", "Apagar el equipo", "red", ("power", "poweroff"), "systemctl"),
+    ]),
+}
+
+COLORS = {
+    "red": ("#d62839", "#8c1322"),
+    "blue": ("#1f6feb", "#12418f"),
+    "green": ("#0e9f6e", "#08604a"),
+    "purple": ("#8a3ffc", "#52259b"),
+    "orange": ("#f08a24", "#a8540b"),
+    "slate": ("#52627a", "#2c3748"),
+    "indigo": ("#3a4fd6", "#212d85"),
+    "violet": ("#a145d8", "#62267f"),
+    "amber": ("#e0a800", "#8a6500"),
+}
+
+
+def build_css(scale):
+    def px(value):
+        return int(round(value * scale))
+
+    css = """
+window {{ background-color: #05070b; color: #f5f7fb; }}
+.title {{ color: #f7f8fc; font-size: {t}px; font-weight: bold; }}
+.clock {{ color: #f7f8fc; font-size: {c}px; font-weight: bold; }}
+.subtitle {{ color: #9ba8bd; font-size: {s}px; }}
+.tile {{ border-radius: {r}px; border: 4px solid transparent; padding: {p}px;
+         background-image: none; background-color: #101827; color: #ffffff;
+         box-shadow: none; text-shadow: none; }}
+.tile:hover {{ border-color: #c9d6ee; }}
+.tile:focus {{ border-color: #ffffff; }}
+.glyph {{ font-size: {g}px; color: rgba(255,255,255,0.92); }}
+.tile-title {{ font-size: {tt}px; font-weight: bold; color: #ffffff; }}
+.tile-desc {{ font-size: {td}px; color: rgba(255,255,255,0.80); }}
+""".format(t=px(30), c=px(24), s=px(14), r=px(18), p=px(14),
+           g=px(44), tt=px(22), td=px(14))
+    for name, (light, dark) in COLORS.items():
+        css += (".c-%s {background-image: linear-gradient(135deg, %s, %s);}\n"
+                % (name, light, dark))
+    return css.encode("utf-8")
+
+
+class LibianTV(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="LIBIAN TV")
+        self.exit_code = 0
+        self.history = []
+        self.first_tile = {}
+
+        screen = Gdk.Screen.get_default()
+        width, height = screen.get_width(), screen.get_height()
+        scale = max(1.0, height / 720.0)
+        self.scale = scale
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(build_css(scale))
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # Ventana sin bordes y maximizada (no "fullscreen"): así las
+        # aplicaciones que se abren quedan por encima del menú.
+        self.set_decorated(False)
+        self.set_default_size(width, height)
+        self.move(0, 0)
+        self.maximize()
+        self.connect("key-press-event", self.on_key)
+        self.connect("destroy", self.on_destroy)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(18 * scale))
+        outer.set_border_width(int(32 * scale))
+        self.add(outer)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        brand = Gtk.Label()
+        brand.set_markup(
+            '<span foreground="#ffffff" size="xx-large" weight="bold">▣ LIBIAN '
+            '<span foreground="#5b9dff">TV</span></span>')
+        brand.set_xalign(0)
+        header.pack_start(brand, True, True, 0)
+        self.clock = Gtk.Label()
+        self.clock.get_style_context().add_class("clock")
+        header.pack_end(self.clock, False, False, 0)
+        outer.pack_start(header, False, False, 0)
+
+        self.heading = Gtk.Label()
+        self.heading.set_xalign(0)
+        self.heading.get_style_context().add_class("title")
+        outer.pack_start(self.heading, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+        outer.pack_start(self.stack, True, True, 0)
+
+        for name, (_title, items) in PAGES.items():
+            self.stack.add_named(self.build_page(name, items), name)
+
+        self.status = Gtk.Label(label="")
+        self.status.set_xalign(0)
+        self.status.get_style_context().add_class("subtitle")
+        outer.pack_end(self.status, False, False, 0)
+        self.set_status_idle()
+
+        self.update_clock()
+        GLib.timeout_add_seconds(20, self.update_clock)
+        self.show_page("main", push=False)
+
+    # -- construcción ------------------------------------------------------
+    def build_page(self, name, items):
+        grid = Gtk.Grid()
+        grid.set_row_spacing(int(16 * self.scale))
+        grid.set_column_spacing(int(16 * self.scale))
+        grid.set_row_homogeneous(True)
+        grid.set_column_homogeneous(True)
+        grid.set_valign(Gtk.Align.CENTER)
+
+        visible = [it for it in items if it[5] is None or shutil.which(it[5])]
+        if name == "apps" and not is_live():
+            visible = [it for it in visible if it[4][0] != "install"]
+        if not visible:
+            label = Gtk.Label(label="No hay aplicaciones instaladas en esta sección.")
+            label.get_style_context().add_class("subtitle")
+            grid.attach(label, 0, 0, 1, 1)
+            self.first_tile[name] = None
+            return grid
+
+        for index, (glyph, title, desc, color, action, _req) in enumerate(visible):
+            button = Gtk.Button()
+            ctx = button.get_style_context()
+            ctx.add_class("tile")
+            ctx.add_class("c-" + color)
+            button.set_size_request(int(260 * self.scale), int(130 * self.scale))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(4 * self.scale))
+            g = Gtk.Label(label=glyph)
+            g.set_xalign(0)
+            g.get_style_context().add_class("glyph")
+            t = Gtk.Label(label=title)
+            t.set_xalign(0)
+            t.get_style_context().add_class("tile-title")
+            d = Gtk.Label(label=desc)
+            d.set_xalign(0)
+            d.get_style_context().add_class("tile-desc")
+            box.pack_start(g, True, True, 0)
+            box.pack_start(t, False, False, 0)
+            box.pack_start(d, False, False, 0)
+            button.add(box)
+            button.connect("clicked", self.on_tile, title, action)
+            grid.attach(button, index % 3, index // 3, 1, 1)
+            if index == 0:
+                self.first_tile[name] = button
+        return grid
+
+    # -- navegación ----------------------------------------------------------
+    def show_page(self, name, push=True):
+        if push:
+            self.history.append(self.stack.get_visible_child_name() or "main")
+        self.stack.set_visible_child_name(name)
+        self.heading.set_text(PAGES[name][0])
+        tile = self.first_tile.get(name)
+        if tile is not None:
+            tile.grab_focus()
+
+    def go_back(self):
+        if self.history:
+            self.show_page(self.history.pop(), push=False)
+
+    def on_key(self, _window, event):
+        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
+            self.go_back()
+            return True
+        if event.keyval == Gdk.KEY_Home:
+            self.history.clear()
+            self.show_page("main", push=False)
+            return True
+        return False
+
+    # -- acciones ------------------------------------------------------------
+    def on_tile(self, _button, title, action):
+        kind, value = action
+        if kind == "page":
+            self.show_page(value)
+        elif kind == "web":
+            self.announce("Abriendo %s…" % title)
+            self.launch(["firefox-esr", "--kiosk", value])
+        elif kind == "cmd":
+            self.announce("Abriendo %s…" % title)
+            self.launch(value)
+        elif kind == "usb":
+            self.announce("Abriendo USB…")
+            self.launch(["thunar", usb_folder()])
+        elif kind == "install":
+            if self.confirm("¿Instalar LIBIAN TV en el disco duro?",
+                            "Se abrirá el instalador. Revisa con cuidado el disco "
+                            "elegido: la instalación puede borrar datos."):
+                self.launch(["sudo", "-E", "calamares"])
+        elif kind == "exit":
+            self.exit_code = value
+            Gtk.main_quit()
+        elif kind == "power":
+            label = "Reiniciar" if value == "reboot" else "Apagar"
+            if self.confirm("¿%s el equipo?" % label, ""):
+                self.launch(["systemctl", value])
+
+    def launch(self, args):
+        if shutil.which(args[0]) is None:
+            self.message("No se pudo abrir la aplicación",
+                         "No está instalado: %s" % args[0])
+            return
+        try:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as exc:
+            self.message("No se pudo abrir la aplicación", str(exc))
+
+    def announce(self, text):
+        self.status.set_text(text)
+        GLib.timeout_add_seconds(6, self.set_status_idle)
+
+    def set_status_idle(self):
+        self.status.set_text("LIBIAN TV  •  Flechas y Enter para moverte  •  "
+                             "Esc para volver")
+        return False
+
+    def update_clock(self):
+        self.clock.set_text(time.strftime("%H:%M"))
+        return True
+
+    def message(self, text, secondary):
+        dialog = Gtk.MessageDialog(transient_for=self, flags=0,
+                                   message_type=Gtk.MessageType.ERROR,
+                                   buttons=Gtk.ButtonsType.OK, text=text)
+        dialog.format_secondary_text(secondary)
+        dialog.run()
+        dialog.destroy()
+
+    def confirm(self, text, secondary):
+        dialog = Gtk.MessageDialog(transient_for=self, flags=0,
+                                   message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.YES_NO, text=text)
+        if secondary:
+            dialog.format_secondary_text(secondary)
+        answer = dialog.run()
+        dialog.destroy()
+        return answer == Gtk.ResponseType.YES
+
+    def on_destroy(self, _window):
+        Gtk.main_quit()
+
+
+def main():
+    win = LibianTV()
+    win.show_all()
+
+    def ready():
+        syslog.syslog(syslog.LOG_INFO, "LIBIAN-TV-READY")
+        return False
+
+    GLib.idle_add(ready)
+    Gtk.main()
+    return win.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

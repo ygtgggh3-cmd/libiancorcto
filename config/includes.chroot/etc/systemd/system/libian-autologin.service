@@ -1,0 +1,11 @@
+[Unit]
+Description=LIBIAN TV: configurar inicio automatico en la interfaz de TV
+After=live-config.service
+Before=display-manager.service lightdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/libian/autologin.sh
+
+[Install]
+WantedBy=graphical.target

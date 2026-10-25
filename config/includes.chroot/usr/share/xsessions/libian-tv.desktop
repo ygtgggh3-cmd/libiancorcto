@@ -1,0 +1,7 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LIBIAN TV
+Comment=Interfaz de Smart TV a pantalla completa
+Exec=/usr/local/bin/libian-tv-session
+TryExec=/usr/local/bin/libian-tv-session
