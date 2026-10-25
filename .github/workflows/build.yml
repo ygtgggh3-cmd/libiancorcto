@@ -1,0 +1,107 @@
+name: Build LIBIAN TV ISO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md', 'LICENSE' ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Get project
+        uses: actions/checkout@v4
+
+      - name: Validate project files (fast fail)
+        run: |
+          set -e
+          python3 -m py_compile config/includes.chroot/usr/local/bin/libian-tv
+          for f in auto/config auto/clean scripts/*.sh \
+                   config/hooks/live/*.hook.chroot \
+                   config/includes.chroot/usr/local/bin/libian-tv-session \
+                   config/includes.chroot/usr/local/lib/libian/autologin.sh; do
+            bash -n "$f" && echo "syntax ok: $f"
+          done
+          python3 -c "import yaml; yaml.safe_load(open('.github/workflows/build.yml'))"
+          chmod +x auto/config auto/clean scripts/*.sh config/hooks/live/*.hook.chroot \
+                   config/includes.chroot/usr/local/bin/libian-tv \
+                   config/includes.chroot/usr/local/bin/libian-tv-session \
+                   config/includes.chroot/usr/local/lib/libian/autologin.sh
+
+      - name: Free disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Build ISO inside Debian trixie (live-build)
+        run: |
+          echo "## LIBIAN TV: resultado de la compilación" >> "$GITHUB_STEP_SUMMARY"
+          sudo docker run --rm --privileged \
+            -v "$PWD":/work -w /work \
+            -v "$GITHUB_STEP_SUMMARY":/tmp/summary.md -e GITHUB_STEP_SUMMARY=/tmp/summary.md \
+            debian:trixie bash scripts/build.sh
+          sudo chown -R "$(id -u):$(id -g)" . || true
+
+      - name: Show ISO
+        run: |
+          ls -lh output/
+          cat output/SHA256SUMS
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libian-tv-iso
+          path: |
+            output/libian-tv-amd64.iso
+            output/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libian-tv-build-log
+          path: |
+            build.log
+            output/build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Boot smoke test (QEMU, 3 GB RAM)
+        id: smoke
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 imagemagick libarchive-tools xorriso
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          bash scripts/smoke-test.sh output/libian-tv-amd64.iso smoke 1200
+
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libian-tv-smoke-test
+          path: smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Final status
+        if: always()
+        run: |
+          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            echo "### Prueba de arranque: OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Prueba de arranque: FALLÓ o no se ejecutó. La ISO existe y es estructuralmente válida, pero NO está confirmado que arranque. Revisa el artefacto libian-tv-smoke-test." >> "$GITHUB_STEP_SUMMARY"
+          fi

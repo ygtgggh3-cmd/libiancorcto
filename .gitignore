@@ -1,0 +1,20 @@
+# live-build
+/.build/
+/binary/
+/chroot/
+/cache/
+/local/
+/config/binary
+/config/bootstrap
+/config/chroot
+/config/common
+/config/source
+/*.iso
+/*.hybrid.iso
+/*.contents
+/*.files
+/*.packages
+/*.log
+/output/
+/smoke/
+__pycache__/
