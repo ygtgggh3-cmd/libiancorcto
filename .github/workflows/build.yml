@@ -49,9 +49,14 @@ jobs:
           set -o pipefail
           sudo docker run --rm --privileged \
             -v "$PWD":/work -w /work \
-            -v "$GITHUB_STEP_SUMMARY":/tmp/summary.md -e GITHUB_STEP_SUMMARY=/tmp/summary.md \
+            -e GITHUB_STEP_SUMMARY=/work/summary.md \
             debian:trixie bash scripts/build.sh 2>&1 | tee docker.log
           sudo chown -R "$(id -u):$(id -g)" . || true
+
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f summary.md ]; then cat summary.md >> "$GITHUB_STEP_SUMMARY"; fi
 
       - name: Report build failure (readable in annotations)
         if: failure()
@@ -88,6 +93,7 @@ jobs:
           name: libian-tv-build-log
           path: |
             build.log
+            docker.log
             output/build.log
           if-no-files-found: ignore
           retention-days: 14
