@@ -46,11 +46,24 @@ jobs:
       - name: Build ISO inside Debian trixie (live-build)
         run: |
           echo "## LIBIAN TV: resultado de la compilación" >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
           sudo docker run --rm --privileged \
             -v "$PWD":/work -w /work \
             -v "$GITHUB_STEP_SUMMARY":/tmp/summary.md -e GITHUB_STEP_SUMMARY=/tmp/summary.md \
-            debian:trixie bash scripts/build.sh
+            debian:trixie bash scripts/build.sh 2>&1 | tee docker.log
           sudo chown -R "$(id -u):$(id -g)" . || true
+
+      - name: Report build failure (readable in annotations)
+        if: failure()
+        run: |
+          # Las últimas líneas del registro, como anotación de error.
+          for n in 1; do
+            msg=$(tail -n 40 docker.log 2>/dev/null | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=Fallo de compilacion (ultimas lineas)::${msg}"
+          done
+          grep -n -i -E 'ERROR|E: |SELFCHECK|FALL' docker.log 2>/dev/null | tail -n 15 | tr -d '\r' | while IFS= read -r l; do
+            echo "::warning::$(printf '%s' "$l" | sed -e 's/%/%25/g' | cut -c1-400)"
+          done
 
       - name: Show ISO
         run: |
