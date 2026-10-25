@@ -57,13 +57,20 @@ Signed-By: $KEYRING
 EOT
 apt-get update
 # Cordura: si el índice no cargó, TODOS los paquetes parecerían inexistentes.
-if ! apt-cache policy bash 2>/dev/null | grep -q 'Candidate: [^(]'; then
+# OJO: no usar "apt-cache | grep -q" con pipefail: grep -q cierra la tubería y apt-cache
+# muere por SIGPIPE, lo que haría fallar siempre. Se captura la salida primero.
+exists() {
+    local out
+    out=$(apt-cache policy "$1" 2>/dev/null) || return 1
+    grep -q 'Candidate: [^(]' <<<"$out"
+}
+if ! exists bash; then
     echo "ERROR: el índice de apt no cargó (apt-cache no conoce ni 'bash'); revisa la salida de apt-get update"
     exit 1
 fi
 
 pkgs() { sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^$' || true; }
-exists() { apt-cache policy "$1" 2>/dev/null | grep -q 'Candidate: [^(]'; }
+
 
 missing_core=()
 while read -r p; do
