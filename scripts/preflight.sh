@@ -39,20 +39,28 @@ done
 
 echo "== 2/2 Paquetes de las listas =="
 rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list
+KEYRING=$(ls /usr/share/keyrings/debian-archive-keyring.pgp /usr/share/keyrings/debian-archive-keyring.gpg 2>/dev/null | head -n1)
+[ -n "$KEYRING" ] || { echo "ERROR: no se encuentra debian-archive-keyring en el contenedor"; exit 1; }
+echo "Llavero de firmas: $KEYRING"
 cat > /etc/apt/sources.list.d/libian-check.sources <<EOT
 Types: deb
 URIs: $MAIN
 Suites: trixie trixie-updates
 Components: main non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Signed-By: $KEYRING
 
 Types: deb
 URIs: $SEC
 Suites: trixie-security
 Components: main non-free-firmware
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Signed-By: $KEYRING
 EOT
-apt-get update -qq
+apt-get update
+# Cordura: si el índice no cargó, TODOS los paquetes parecerían inexistentes.
+if ! apt-cache policy bash 2>/dev/null | grep -q 'Candidate: [^(]'; then
+    echo "ERROR: el índice de apt no cargó (apt-cache no conoce ni 'bash'); revisa la salida de apt-get update"
+    exit 1
+fi
 
 pkgs() { sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^$' || true; }
 exists() { apt-cache policy "$1" 2>/dev/null | grep -q 'Candidate: [^(]'; }
