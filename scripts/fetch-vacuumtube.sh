@@ -1,50 +1,87 @@
 #!/usr/bin/env bash
-# Descarga el .deb más reciente de VacuumTube (envoltorio de YouTube Leanback/TV, MIT,
+# Descarga el .deb de VacuumTube (envoltorio de YouTube Leanback/TV, MIT,
 # https://github.com/shy1132/VacuumTube) a config/packages.chroot/. live-build lo instala
-# en la ISO. Si no se puede descargar, la compilación continúa SIN VacuumTube (el menú
-# usa entonces Firefox para YouTube) y queda avisado; con REQUIRE_VACUUMTUBE=1 falla.
+# en la ISO. Intenta, en orden:
+#   1) enlaces directos «latest/download/…»
+#   2) la API de GitHub (última versión y, si no, las 15 últimas incluidas pre-versiones)
+# Si todo falla, la compilación continúa SIN VacuumTube (el menú usa Firefox para YouTube) y
+# lo avisa con el motivo; con REQUIRE_VACUUMTUBE=1 falla.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 DEST=config/packages.chroot
+REPO=shy1132/VacuumTube
 mkdir -p "$DEST"
 rm -f "$DEST"/*.deb
-
-soft_fail() {
-    echo "::warning::VacuumTube no se instaló: $1"
-    echo "- AVISO VacuumTube NO instalado: $1" >> "$SUMMARY"
-    [ "${REQUIRE_VACUUMTUBE:-0}" = "1" ] && exit 1
-    exit 0
-}
+TMP=$(mktemp -d)
+reasons=()
 
 auth=()
 [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-json=$(curl -fsSL --retry 3 --max-time 60 "${auth[@]}" \
-        -H 'Accept: application/vnd.github+json' \
-        "https://api.github.com/repos/shy1132/VacuumTube/releases/latest") \
-    || soft_fail "no se pudo consultar la última versión en GitHub"
 
-read -r tag url name < <(python3 -c '
+validate() {  # $1 = archivo .deb ; devuelve 0 si es un paquete amd64 válido
+    local arch pkg
+    arch=$(dpkg-deb -f "$1" Architecture 2>/dev/null || true)
+    pkg=$(dpkg-deb -f "$1" Package 2>/dev/null || true)
+    [ -n "$pkg" ] && { [ "$arch" = "amd64" ] || [ "$arch" = "all" ]; }
+}
+
+accept() {  # $1 = archivo, $2 = origen
+    local pkg ver
+    pkg=$(dpkg-deb -f "$1" Package); ver=$(dpkg-deb -f "$1" Version)
+    mv "$1" "$DEST/${pkg}_${ver}_amd64.deb"
+    echo "Depends: $(dpkg-deb -f "$DEST/${pkg}_${ver}_amd64.deb" Depends 2>/dev/null)"
+    echo "VacuumTube OK: $pkg $ver desde $2 ($(stat -c %s "$DEST/${pkg}_${ver}_amd64.deb") bytes, sha256 $(sha256sum "$DEST/${pkg}_${ver}_amd64.deb" | cut -d' ' -f1))"
+    echo "- OK VacuumTube incluido: paquete \`$pkg\` $ver ($2)" >> "$SUMMARY"
+    exit 0
+}
+
+download() {  # $1 = url ; deja el archivo en $TMP/dl.deb
+    local code
+    code=$(curl -sSL --retry 3 --max-time 600 -o "$TMP/dl.deb" -w '%{http_code}' "$1" 2>"$TMP/err") || true
+    if [ "$code" = "200" ] && validate "$TMP/dl.deb"; then return 0; fi
+    reasons+=("$1 -> HTTP $code $(head -c 120 "$TMP/err" | tr '\n' ' ')")
+    return 1
+}
+
+# 1) enlaces directos
+for name in VacuumTube-amd64.deb VacuumTube-x86_64.deb vacuumtube_amd64.deb; do
+    url="https://github.com/$REPO/releases/latest/download/$name"
+    echo "Probando $url"
+    if download "$url"; then accept "$TMP/dl.deb" "$url"; fi
+done
+
+# 2) API de GitHub
+for api in "https://api.github.com/repos/$REPO/releases/latest" \
+           "https://api.github.com/repos/$REPO/releases?per_page=15"; do
+    code=$(curl -sS --retry 3 --max-time 60 "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+           -o "$TMP/api.json" -w '%{http_code}' "$api" 2>"$TMP/err") || true
+    if [ "$code" != "200" ]; then
+        reasons+=("$api -> HTTP $code $(head -c 150 "$TMP/api.json" "$TMP/err" 2>/dev/null | tr '\n' ' ')")
+        continue
+    fi
+    url=$(python3 - "$TMP/api.json" <<'PY'
 import json, re, sys
-d = json.load(sys.stdin)
-debs = [a for a in d.get("assets", []) if a["name"].lower().endswith(".deb")]
-pref = [a for a in debs if re.search(r"(amd64|x86_64|x64)", a["name"], re.I)] or debs
-if not pref:
-    sys.exit(1)
-a = pref[0]
-print(d.get("tag_name", "?"), a["browser_download_url"], a["name"])
-' <<<"$json") || soft_fail "la última versión no trae un paquete .deb"
+d = json.load(open(sys.argv[1]))
+rels = d if isinstance(d, list) else [d]
+for rel in rels:
+    debs = [a for a in rel.get("assets", []) if a["name"].lower().endswith(".deb")]
+    pref = [a for a in debs if re.search(r"(amd64|x86_64|x64)", a["name"], re.I)] or debs
+    if pref:
+        print(pref[0]["browser_download_url"])
+        break
+PY
+) || true
+    if [ -z "$url" ]; then
+        reasons+=("$api -> sin paquete .deb en las versiones")
+        continue
+    fi
+    echo "Probando (API) $url"
+    if download "$url"; then accept "$TMP/dl.deb" "$url"; fi
+done
 
-echo "Descargando VacuumTube $tag: $name"
-curl -fL --retry 3 --max-time 600 -o "$DEST/$name" "$url" || soft_fail "falló la descarga de $url"
-
-arch=$(dpkg-deb -f "$DEST/$name" Architecture 2>/dev/null || true)
-pkg=$(dpkg-deb -f "$DEST/$name" Package 2>/dev/null || true)
-ver=$(dpkg-deb -f "$DEST/$name" Version 2>/dev/null || true)
-if [ -z "$pkg" ] || { [ "$arch" != "amd64" ] && [ "$arch" != "all" ]; }; then
-    rm -f "$DEST/$name"
-    soft_fail "el .deb descargado no es válido o no es amd64 (Package=$pkg Architecture=$arch)"
-fi
-echo "Depends: $(dpkg-deb -f "$DEST/$name" Depends 2>/dev/null)"
-echo "VacuumTube OK: paquete $pkg $ver ($arch), $(stat -c %s "$DEST/$name") bytes, sha256 $(sha256sum "$DEST/$name" | cut -d' ' -f1)"
-echo "- OK VacuumTube $tag incluido (paquete \`$pkg\` $ver, $arch)" >> "$SUMMARY"
+msg="${reasons[*]}"
+echo "::warning::VacuumTube NO se instaló. Intentos: ${msg:0:900}"
+echo "- AVISO VacuumTube NO instalado. Intentos: \`${msg:0:900}\`" >> "$SUMMARY"
+[ "${REQUIRE_VACUUMTUBE:-0}" = "1" ] && exit 1
+exit 0
