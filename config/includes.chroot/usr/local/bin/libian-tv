@@ -7,6 +7,7 @@ Códigos de salida (los usa /usr/local/bin/libian-tv-session):
     42 -> el usuario pidió el escritorio XFCE completo
 """
 import glob
+import json
 import os
 import shlex
 import shutil
@@ -290,6 +291,37 @@ def find_vacuumtube():
     return None
 
 
+VACUUMTUBE_CONFIG = os.path.expanduser("~/.config/VacuumTube/config.json")
+# Valores pensados para PC antiguas (nombres de claves tomados del código de VacuumTube 2.0.1).
+VACUUMTUBE_DEFAULTS = {
+    "h264ify": True,                  # YouTube solo envía H.264 (la CPU antigua no decodifica VP9/AV1)
+    "h264ify_disable_webm": True,
+    "h264ify_disable_vp8": True,
+    "h264ify_disable_vp9": True,
+    "h264ify_disable_av1": True,
+    "low_memory_mode": True,          # YouTube usa menos memoria / búferes más pequeños
+    "remove_super_resolution": True,  # sin calidades «reescaladas por IA»
+    "hide_shorts": True,
+    "unlock_resolution": False,       # no pasar de la resolución de la pantalla
+    "device_discoverability": False,  # sin servicio DIAL en segundo plano
+    "auto_update": False,             # no actualizarse solo (la ISO ya trae una versión)
+    "touch_overlay": False,
+}
+
+
+def vacuumtube_prepare():
+    """Crea config.json con ajustes ligeros solo si no existe (no pisa lo que elija el usuario)."""
+    try:
+        if os.path.exists(VACUUMTUBE_CONFIG):
+            return False
+        os.makedirs(os.path.dirname(VACUUMTUBE_CONFIG), exist_ok=True)
+        with open(VACUUMTUBE_CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(VACUUMTUBE_DEFAULTS, fh, indent=4)
+        return True
+    except OSError:
+        return False
+
+
 FIREFOX_USERJS = """\
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.aboutwelcome.enabled", false);
@@ -306,6 +338,11 @@ user_pref("dom.ipc.processCount", 2);
 user_pref("browser.cache.memory.capacity", 65536);
 user_pref("extensions.autoDisableScopes", 0);
 user_pref("extensions.enabledScopes", 15);
+user_pref("media.mediasource.vp9.enabled", false);
+user_pref("media.mediasource.webm.enabled", false);
+user_pref("media.av1.enabled", false);
+user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("general.smoothScroll", false);
 user_pref("browser.download.dir", "%s");
 """
 
@@ -1265,6 +1302,7 @@ class LibianTV(Gtk.Window):
         vt = find_vacuumtube()
         if vt:
             self.announce("Abriendo YouTube TV…")
+            vacuumtube_prepare()
             self.launch_managed(vt, "basic")
         elif shutil.which("firefox-esr"):
             self.announce("Abriendo YouTube…")
@@ -1432,6 +1470,11 @@ class LibianTV(Gtk.Window):
             nets = parse_wifi_list("*:Mi Red\\:5G:80:WPA2\n :Otra:30:--\n")
             assert nets[0]["ssid"] == "Mi Red:5G" and nets[0]["active"], nets
             assert nets[1]["secure"] is False, nets
+            assert json.loads(json.dumps(VACUUMTUBE_DEFAULTS))["h264ify"] is True
+            vacuumtube_prepare()
+            if os.path.exists(VACUUMTUBE_CONFIG):
+                with open(VACUUMTUBE_CONFIG, encoding="utf-8") as fh:
+                    assert isinstance(json.load(fh), dict)
             net_status()
             wifi_networks(False)
             self.fill_wifi({"has_wifi": True, "wifi": "X", "ethernet": False, "signal": 60,

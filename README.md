@@ -39,7 +39,7 @@ Si la prueba de arranque falla, la ISO igualmente se publica (es estructuralment
 
 ## Limitaciones conocidas
 - Kernel 64 bits: sirve para CPU de 2008 con soporte x86-64 (Core 2, Phenom, etc.), no para Pentium 4 de 32 bits.
-- VacuumTube es un proyecto de terceros no oficial; es una app Electron y consume bastante RAM (usa su opción *Low Memory Mode* con `Ctrl+O` y filtra códecs si el video va entrecortado). No incluye aún configuración predefinida.
+- VacuumTube es un proyecto de terceros no oficial; es una app Electron y consume bastante RAM. Para PC antiguas, la primera vez que se abre se crea `~/.config/VacuumTube/config.json` con ajustes ligeros: solo video H.264 (sin VP9/AV1), modo de poca memoria, sin DIAL ni actualizaciones automáticas. Se pueden cambiar con `Ctrl+O`. En Firefox se desactivan VP9/AV1 con el mismo fin.
 - Netflix/Prime/Disney+/Max usan DRM (Widevine): Firefox ESR debe poder descargarlo; no está probado aquí. YouTube a 1080p en una CPU de 2008 puede ir justo; usa 480p/720p o `mpv <url>` con `yt-dlp`.
 - La instalación en disco está pensada para **BIOS/MBR** (PC de 2008). En UEFI puede requerir ajustes. Prueba el instalador primero en una VM.
 - Si instalas a disco, el instalador puede **borrar datos**: revisa el disco elegido.
