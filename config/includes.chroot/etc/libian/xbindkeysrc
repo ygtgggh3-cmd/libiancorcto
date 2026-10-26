@@ -1,0 +1,6 @@
+# Atajos globales de LIBIAN TV (los lanza libian-tv-session con xbindkeys)
+"/usr/local/bin/libian-tv-close"
+  control+alt + q
+
+"/usr/local/bin/libian-tv-close"
+  XF86HomePage

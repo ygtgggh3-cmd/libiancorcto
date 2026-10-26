@@ -6,28 +6,69 @@ Códigos de salida (los usa /usr/local/bin/libian-tv-session):
     0  -> la ventana se cerró: la sesión vuelve a lanzar la interfaz
     42 -> el usuario pidió el escritorio XFCE completo
 """
+import glob
 import os
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import syslog
+import threading
 import time
+import traceback
 
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 
+try:
+    import cairo
+except ImportError:  # el logo se dibuja solo si hay cairo
+    cairo = None
+
+VERSION = "1.0.0"
 EXIT_DESKTOP = 42
 syslog.openlog("libian-tv")
 
+DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "libian-tv-app.pgid")
+FIREFOX_PROFILE = os.path.expanduser("~/.config/libian-tv/firefox")
 
-def is_live():
+
+def log(msg):
+    syslog.syslog(syslog.LOG_INFO, msg)
+
+
+def guarded(fn):
+    """Que un error en un botón no tumbe toda la interfaz; se registra en el journal."""
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            syslog.syslog(syslog.LOG_ERR, "LIBIAN-TV-ERROR " +
+                          traceback.format_exc().replace("\n", " | "))
+            return None
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Utilidades del sistema
+# ---------------------------------------------------------------------------
+def cmdline_has(word):
     try:
         with open("/proc/cmdline", encoding="utf-8") as fh:
-            return "boot=live" in fh.read().split()
+            return word in fh.read().split()
     except OSError:
         return False
+
+
+def is_live():
+    return cmdline_has("boot=live")
 
 
 def usb_folder():
@@ -43,27 +84,267 @@ def usb_folder():
     return os.path.expanduser("~")
 
 
+def read_mem():
+    """(usada_MB, total_MB)."""
+    info = {}
+    with open("/proc/meminfo", encoding="utf-8") as fh:
+        for line in fh:
+            key, _, val = line.partition(":")
+            parts = val.split()
+            if parts:
+                info[key] = int(parts[0])
+    total = info.get("MemTotal", 0) / 1024.0
+    avail = info.get("MemAvailable", info.get("MemFree", 0)) / 1024.0
+    return max(total - avail, 0.0), total
+
+
+def fmt_mem(used, total):
+    big = "%.1f GB" % (total / 1024.0) if total >= 1024 else "%d MB" % total
+    return "RAM: %d MB / %s" % (used, big)
+
+
+class CpuMeter:
+    def __init__(self):
+        self.last = None
+
+    def percent(self):
+        with open("/proc/stat", encoding="utf-8") as fh:
+            fields = [int(x) for x in fh.readline().split()[1:]]
+        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+        total = sum(fields)
+        prev, self.last = self.last, (idle, total)
+        if prev is None or total == prev[1]:
+            return 0
+        return int(round(100.0 * (1 - (idle - prev[0]) / float(total - prev[1]))))
+
+
+def fmt_date(tm):
+    return "%s, %d de %s." % (DIAS[tm.tm_wday], tm.tm_mday, MESES[tm.tm_mon - 1])
+
+
+# ---------------------------------------------------------------------------
+# Wi-Fi con NetworkManager (nmcli): todo se hace dentro de la interfaz
+# ---------------------------------------------------------------------------
+def split_terse(line):
+    """Divide una línea de `nmcli -t` respetando los ':' escapados (\\:)."""
+    fields, cur, esc = [], [], False
+    for ch in line:
+        if esc:
+            cur.append(ch)
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    fields.append("".join(cur))
+    return fields
+
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+
+def signal_bars(sig):
+    n = 1 if sig < 25 else 2 if sig < 50 else 3 if sig < 75 else 4
+    return "▂▄▆█"[:n].ljust(4, "·")
+
+
+def parse_wifi_list(text):
+    nets = {}
+    for line in text.splitlines():
+        f = split_terse(line)
+        if len(f) < 4 or not f[1]:
+            continue
+        inuse, ssid, signal_s, sec = f[0], f[1], f[2], f[3]
+        try:
+            sig = int(signal_s)
+        except ValueError:
+            sig = 0
+        cur = nets.get(ssid)
+        active = (inuse == "*") or bool(cur and cur["active"])
+        if cur is None or sig > cur["signal"] or inuse == "*":
+            nets[ssid] = {"ssid": ssid, "signal": sig,
+                          "secure": bool(sec and sec != "--"), "active": active}
+        else:
+            cur["active"] = active
+    return sorted(nets.values(), key=lambda n: (not n["active"], -n["signal"], n["ssid"]))
+
+
+def wifi_networks(rescan=False):
+    rc, out, _err = run(["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
+                         "device", "wifi", "list", "--rescan", "yes" if rescan else "auto"], 45)
+    return parse_wifi_list(out) if rc == 0 else []
+
+
+def known_connections():
+    rc, out, _err = run(["nmcli", "-t", "-f", "NAME", "connection", "show"], 10)
+    return {split_terse(line)[0] for line in out.splitlines()} if rc == 0 else set()
+
+
+def net_status():
+    """{'has_wifi', 'wifi': ssid|None, 'ethernet': bool, 'signal': int}."""
+    st = {"has_wifi": False, "wifi": None, "ethernet": False, "signal": 0, "dev": None}
+    rc, out, _err = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION",
+                         "device", "status"], 10)
+    if rc != 0:
+        return st
+    for line in out.splitlines():
+        f = split_terse(line)
+        if len(f) < 4:
+            continue
+        dev, typ, state, conn = f[0], f[1], f[2], f[3]
+        if typ == "wifi":
+            st["has_wifi"] = True
+            st["dev"] = st["dev"] or dev
+            if state == "connected":
+                st["wifi"] = conn
+                st["dev"] = dev
+        elif typ == "ethernet" and state == "connected":
+            st["ethernet"] = True
+    if st["wifi"]:
+        for net in wifi_networks(False):
+            if net["active"]:
+                st["signal"] = net["signal"]
+                break
+    return st
+
+
+def wifi_connect(ssid, password=None):
+    """Devuelve (ok, mensaje)."""
+    if ssid in known_connections():
+        rc, out, err = run(["nmcli", "--wait", "25", "connection", "up", "id", ssid], 45)
+        if rc == 0:
+            return True, ""
+        if not password:
+            return False, (err or out).strip()
+        run(["nmcli", "connection", "delete", "id", ssid], 10)
+    args = ["nmcli", "--wait", "25", "device", "wifi", "connect", ssid]
+    if password:
+        args += ["password", password]
+    rc, out, err = run(args, 50)
+    if rc != 0:
+        run(["nmcli", "connection", "delete", "id", ssid], 10)  # no dejar perfiles rotos
+        return False, (err or out).strip()
+    return True, ""
+
+
+def wifi_disconnect(dev):
+    if not dev:
+        return False
+    rc, _out, _err = run(["nmcli", "device", "disconnect", dev], 20)
+    return rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Aplicaciones externas
+# ---------------------------------------------------------------------------
+def exec_from_desktop(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Exec="):
+                    parts = [p for p in shlex.split(line[5:].strip()) if not p.startswith("%")]
+                    return parts or None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def icon_from_desktop(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Icon="):
+                    return line[5:].strip()
+    except OSError:
+        pass
+    return None
+
+
+def vacuumtube_desktop():
+    found = glob.glob("/usr/share/applications/*[Vv]acuum[Tt]ube*.desktop")
+    return found[0] if found else None
+
+
+def find_vacuumtube():
+    """Comando de VacuumTube (YouTube para TV) o None si no está instalado."""
+    exe = shutil.which("vacuumtube")
+    if exe:
+        return [exe]
+    desktop = vacuumtube_desktop()
+    if desktop:
+        args = exec_from_desktop(desktop)
+        if args:
+            return args
+    for path in glob.glob("/opt/*/[Vv]acuum[Tt]ube") + glob.glob("/opt/[Vv]acuum[Tt]ube*/vacuumtube"):
+        if os.access(path, os.X_OK):
+            return [path]
+    return None
+
+
+FIREFOX_USERJS = """\
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("toolkit.startup.max_resumed_crashes", -1);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("signon.rememberSignons", false);
+user_pref("dom.ipc.processCount", 2);
+user_pref("browser.cache.memory.capacity", 65536);
+user_pref("extensions.autoDisableScopes", 0);
+user_pref("extensions.enabledScopes", 15);
+user_pref("browser.download.dir", "%s");
+"""
+
+
+def firefox_command(url):
+    """Firefox propio de LIBIAN TV: perfil aparte y sin 'remote', para poder cerrarlo."""
+    try:
+        os.makedirs(FIREFOX_PROFILE, exist_ok=True)
+        userjs = os.path.join(FIREFOX_PROFILE, "user.js")
+        if not os.path.exists(userjs):
+            with open(userjs, "w", encoding="utf-8") as fh:
+                fh.write(FIREFOX_USERJS % os.path.expanduser("~/Descargas").replace('"', ""))
+    except OSError:
+        pass
+    return ["firefox-esr", "--no-remote", "--profile", FIREFOX_PROFILE, "--kiosk", url]
+
+
 # ---------------------------------------------------------------------------
 # Definición del menú.  Cada elemento:
 #   (glifo, título, descripción, color, acción, comando_requerido)
-# Acciones: ("page", nombre) ("cmd", [args]) ("web", url) ("exit", código)
-#           ("power", "poweroff"|"reboot")
+# Acciones: ("page", n) ("cmd", [args]) ("web", url) ("youtube",) ("usb",)
+#           ("install",) ("exit", código) ("power", "poweroff"|"reboot")
+#           ("wifi",) ("vol", "5%+"|"5%-"|"mute")
 # Los elementos cuyo comando no está instalado se ocultan automáticamente.
 # ---------------------------------------------------------------------------
 def web(title, desc, color, url):
     return ("▶", title, desc, color, ("web", url), "firefox-esr")
 
 
+HOME_TILES = [
+    ("▶", "YouTube", "Videos, canales y más", "red", ("youtube",), None),
+    ("▣", "Streaming", "Tus series y películas", "blue", ("page", "streaming"), None),
+    ("▤", "USB", "Videos, música y fotos", "green", ("page", "usb"), None),
+    ("♞", "Juegos", "Diversión sin límites", "purple", ("page", "games"), None),
+    ("▦", "Aplicaciones", "Más herramientas", "orange", ("page", "apps"), None),
+    ("⚙", "Ajustes", "Personaliza tu experiencia", "slate", ("page", "settings"), None),
+]
+
 PAGES = {
-    "main": ("¿Qué quieres hacer hoy?", [
-        ("▶", "YouTube", "Videos y canales", "red",
-         ("web", "https://www.youtube.com/"), "firefox-esr"),
-        ("▣", "Streaming", "Series y películas", "blue", ("page", "streaming"), None),
-        ("▤", "USB y Videos", "Tus archivos multimedia", "green", ("page", "usb"), None),
-        ("♞", "Juegos", "Para pasar el rato", "purple", ("page", "games"), None),
-        ("▦", "Aplicaciones", "Archivos, terminal y más", "orange", ("page", "apps"), None),
-        ("⚙", "Ajustes", "Red, sonido y pantalla", "slate", ("page", "settings"), None),
-    ]),
     "streaming": ("Streaming", [
         web("Netflix", "netflix.com", "red", "https://www.netflix.com/"),
         web("Prime Video", "primevideo.com", "blue", "https://www.primevideo.com/"),
@@ -72,11 +353,10 @@ PAGES = {
         web("Pluto TV", "Gratis, con canales en vivo", "orange", "https://pluto.tv/"),
         web("Twitch", "twitch.tv", "violet", "https://www.twitch.tv/"),
         web("Crunchyroll", "Anime", "amber", "https://www.crunchyroll.com/"),
-        web("YouTube modo TV", "youtube.com/tv (experimental)", "red", "https://www.youtube.com/tv"),
+        web("YouTube web", "youtube.com en el navegador", "red", "https://www.youtube.com/"),
     ]),
-    "usb": ("USB y Videos", [
-        ("▤", "Explorar USB", "Abrir memorias y discos", "green",
-         ("usb", None), "thunar"),
+    "usb": ("USB, videos y música", [
+        ("▤", "Explorar USB", "Abrir memorias y discos", "green", ("usb",), "thunar"),
         ("▶", "Reproductor VLC", "Videos y música", "orange", ("cmd", ["vlc"]), "vlc"),
         ("▶", "Reproductor MPV", "Ligero y rápido", "blue",
          ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
@@ -92,20 +372,23 @@ PAGES = {
          ("cmd", ["supertux2"]), "supertux2"),
     ]),
     "apps": ("Aplicaciones", [
-        ("◎", "Navegador web", "Firefox", "orange", ("cmd", ["firefox-esr"]), "firefox-esr"),
+        ("◎", "Navegador web", "Firefox con barra para cerrar", "orange",
+         ("web", "about:home"), "firefox-esr"),
         ("▤", "Archivos", "Administrador de archivos", "green", ("cmd", ["thunar"]), "thunar"),
         ("▶", "Reproductor", "VLC", "blue", ("cmd", ["vlc"]), "vlc"),
         ("▣", "Terminal", "Línea de comandos", "slate",
          ("cmd", ["xfce4-terminal"]), "xfce4-terminal"),
         ("⬇", "Instalar LIBIAN TV", "Instalar en el disco duro", "red",
-         ("install", None), "calamares"),
+         ("install",), "calamares"),
         ("▦", "Escritorio XFCE", "Escritorio tradicional", "purple",
          ("exit", EXIT_DESKTOP), None),
     ]),
     "settings": ("Ajustes", [
-        ("◉", "Red y Wi-Fi", "Conectarse a internet", "blue",
-         ("cmd", ["nm-connection-editor"]), "nm-connection-editor"),
-        ("♪", "Sonido", "Volumen y salida de audio", "green",
+        ("◉", "Red y Wi-Fi", "Conectarte a internet", "blue", ("wifi",), None),
+        ("♪", "Subir volumen", "+5 %", "green", ("vol", "5%+"), "wpctl"),
+        ("♪", "Bajar volumen", "−5 %", "green", ("vol", "5%-"), "wpctl"),
+        ("✕", "Silenciar", "Activar / desactivar", "slate", ("vol", "mute"), "wpctl"),
+        ("♫", "Mezclador de sonido", "Salida de audio", "indigo",
          ("cmd", ["pavucontrol"]), "pavucontrol"),
         ("▭", "Pantalla", "Resolución y monitores", "purple",
          ("cmd", ["xfce4-display-settings"]), "xfce4-display-settings"),
@@ -117,6 +400,19 @@ PAGES = {
         ("⏻", "Apagar", "Apagar el equipo", "red", ("power", "poweroff"), "systemctl"),
     ]),
 }
+
+# Fila "Mis aplicaciones": (iconos posibles, glifo, título, acción, requerido)
+APP_ROW = [
+    (["firefox-esr", "firefox"], "◎", "Navegador", ("web", "about:home"), "firefox-esr"),
+    (["vlc"], "▶", "VLC", ("cmd", ["vlc"]), "vlc"),
+    (["mpv"], "▶", "MPV", ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
+    (["org.xfce.terminal", "utilities-terminal"], "▣", "Terminal",
+     ("cmd", ["xfce4-terminal"]), "xfce4-terminal"),
+    (["org.xfce.thunar", "system-file-manager"], "▤", "Archivos",
+     ("cmd", ["thunar"]), "thunar"),
+    (["network-wireless", "network-wireless-symbolic"], "◉", "Wi-Fi", ("wifi",), None),
+    (["calamares", "system-software-install"], "⬇", "Instalar", ("install",), "calamares"),
+]
 
 COLORS = {
     "red": ("#d62839", "#8c1322"),
@@ -130,46 +426,167 @@ COLORS = {
     "amber": ("#e0a800", "#8a6500"),
 }
 
+SIDEBAR = [
+    ("⌂", "Inicio", "home"),
+    ("▶", "YouTube", "youtube"),
+    ("▣", "Streaming", "streaming"),
+    ("▤", "USB", "usb"),
+    ("♞", "Juegos", "games"),
+    ("▦", "Aplicaciones", "apps"),
+    ("⚙", "Ajustes", "settings"),
+]
 
-def build_css(scale):
+OSK_ROWS = ["1234567890", "qwertyuiop", "asdfghjklñ", "zxcvbnm.-_", "@#$%&!?,*+"]
+
+
+def build_css(scale, gradients=True):
     def px(value):
         return int(round(value * scale))
 
     css = """
 window {{ background-color: #05070b; color: #f5f7fb; }}
+.popup-bar {{ background-color: rgba(10,14,22,0.92); border-radius: {r}px;
+              border: 2px solid #2a3750; }}
 .title {{ color: #f7f8fc; font-size: {t}px; font-weight: bold; }}
+.section {{ color: #f7f8fc; font-size: {sec}px; font-weight: bold; }}
 .clock {{ color: #f7f8fc; font-size: {c}px; font-weight: bold; }}
+.date {{ color: #dfe6f3; font-size: {s}px; }}
 .subtitle {{ color: #9ba8bd; font-size: {s}px; }}
+.sys {{ color: #c9d3e6; font-size: {sm}px; }}
+.brand {{ color: #ffffff; font-size: {b}px; font-weight: bold; }}
+.brand-tv {{ color: #5b9dff; }}
+.tagline {{ color: #9ba8bd; font-size: {s}px; }}
+button {{ background-image: none; box-shadow: none; text-shadow: none; }}
 .tile {{ border-radius: {r}px; border: 4px solid transparent; padding: {p}px;
-         background-image: none; background-color: #101827; color: #ffffff;
-         box-shadow: none; text-shadow: none; }}
+         background-color: #101827; color: #ffffff; }}
 .tile:hover {{ border-color: #c9d6ee; }}
 .tile:focus {{ border-color: #ffffff; }}
 .glyph {{ font-size: {g}px; color: rgba(255,255,255,0.92); }}
 .tile-title {{ font-size: {tt}px; font-weight: bold; color: #ffffff; }}
 .tile-desc {{ font-size: {td}px; color: rgba(255,255,255,0.80); }}
-""".format(t=px(30), c=px(24), s=px(14), r=px(18), p=px(14),
-           g=px(44), tt=px(22), td=px(14))
+.side {{ background-color: transparent; border: 3px solid transparent; border-radius: {sr}px;
+         color: #c9d3e6; padding: {sp}px {sp2}px; font-size: {sf}px; }}
+.side:hover {{ background-color: #131b2b; }}
+.side:focus {{ border-color: #ffffff; }}
+.side-active {{ background-color: #1f5fe0; color: #ffffff; font-weight: bold; }}
+.appbtn {{ background-color: #141b2b; border: 3px solid transparent; border-radius: {sr}px;
+           color: #ffffff; padding: {sp}px; }}
+.appbtn:hover {{ border-color: #c9d6ee; }}
+.appbtn:focus {{ border-color: #ffffff; }}
+.applabel {{ font-size: {td}px; color: #e7edf8; }}
+.netrow {{ background-color: #101827; border: 3px solid transparent; border-radius: {sr}px;
+           color: #ffffff; padding: {sp}px {sp2}px; font-size: {sf}px; }}
+.netrow:focus {{ border-color: #ffffff; }}
+.netrow-active {{ background-color: #0f4d3a; }}
+.key {{ background-color: #1a2335; border: 3px solid transparent; border-radius: {sr}px;
+        color: #ffffff; font-size: {sf}px; padding: {kp}px; }}
+.key:focus {{ border-color: #ffffff; background-color: #2a3a5c; }}
+.key-ok {{ background-color: #0e9f6e; }}
+.key-cancel {{ background-color: #8c1322; }}
+.pwentry {{ font-size: {sf}px; padding: {sp}px; }}
+.barbtn {{ background-color: #1a2335; color: #ffffff; border: 2px solid transparent;
+           border-radius: {sr}px; padding: {kp}px {sp}px; font-size: {sm}px; }}
+.barbtn:hover {{ border-color: #ffffff; }}
+.barclose {{ background-color: #c0212f; font-weight: bold; }}
+""".format(r=px(16), t=px(30), sec=px(24), c=px(30), s=px(15), sm=px(13), b=px(40),
+           p=px(12), g=px(44), tt=px(22), td=px(14), sr=px(12), sp=px(10), sp2=px(14),
+           sf=px(18), kp=px(8))
     for name, (light, dark) in COLORS.items():
-        css += (".c-%s {background-image: linear-gradient(135deg, %s, %s);}\n"
-                % (name, light, dark))
+        if gradients:
+            css += (".c-%s {background-image: linear-gradient(135deg, %s, %s);}\n"
+                    % (name, light, dark))
+        else:
+            css += ".c-%s {background-color: %s;}\n" % (name, light)
     return css.encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Barra flotante para cerrar el navegador / la app abierta
+# ---------------------------------------------------------------------------
+class ControlBar(Gtk.Window):
+    """Ventana sin decoración (override-redirect) siempre por encima de la app."""
+
+    def __init__(self, owner, controls, scale):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.owner = owner
+        self.set_accept_focus(False)
+        self.get_style_context().add_class("popup-bar")
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(6 * scale))
+        box.set_border_width(int(6 * scale))
+        self.add(box)
+        buttons = []
+        if controls == "browser":
+            buttons += [("◀ Atrás", "back"), ("▶", "forward"), ("↻", "reload"),
+                        ("A−", "zoom_out"), ("A+", "zoom_in")]
+        buttons.append(("✕ Cerrar y volver al menú", "close"))
+        for label, action in buttons:
+            btn = Gtk.Button(label=label)
+            btn.set_can_focus(False)
+            ctx = btn.get_style_context()
+            ctx.add_class("barbtn")
+            if action == "close":
+                ctx.add_class("barclose")
+            btn.connect("clicked", self.on_click, action)
+            box.pack_start(btn, False, False, 0)
+        self.timer = GLib.timeout_add(700, self.keep_on_top)
+
+    @guarded
+    def on_click(self, _btn, action):
+        self.owner.bar_action(action)
+
+    def place(self):
+        screen = Gdk.Screen.get_default()
+        nat = self.get_preferred_size()[1]
+        self.move(max(screen.get_width() - nat.width - 12, 0), 10)
+
+    @guarded
+    def keep_on_top(self):
+        win = self.get_window()
+        if win is not None:
+            win.raise_()
+        return True
+
+    def close_bar(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Ventana principal
+# ---------------------------------------------------------------------------
 class LibianTV(Gtk.Window):
     def __init__(self):
         super().__init__(title="LIBIAN TV")
         self.exit_code = 0
         self.history = []
-        self.first_tile = {}
+        self.focus_first = {}
+        self.current = "home"
+        self.app = None
+        self.app_started = 0.0
+        self.bar = None
+        self.cpu = CpuMeter()
+        self.net = {"has_wifi": False, "wifi": None, "ethernet": False, "signal": 0, "dev": None}
+        self.net_busy = False
+        self.wifi_nets = []
+        self.wifi_known = set()
+        self.wifi_busy = False
+        self.pending_ssid = None
+        self.shift = False
+        self.pw_visible = False
 
         screen = Gdk.Screen.get_default()
         width, height = screen.get_width(), screen.get_height()
-        scale = max(1.0, height / 720.0)
-        self.scale = scale
+        self.scale = scale = max(1.0, height / 720.0)
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(build_css(scale))
+        try:
+            provider.load_from_data(build_css(scale))
+        except GLib.Error as exc:
+            syslog.syslog(syslog.LOG_ERR, "LIBIAN-TV-ERROR CSS: %s; usando colores planos" % exc)
+            provider = Gtk.CssProvider()
+            provider.load_from_data(build_css(scale, gradients=False))
         Gtk.StyleContext.add_provider_for_screen(
             screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -182,34 +599,33 @@ class LibianTV(Gtk.Window):
         self.connect("key-press-event", self.on_key)
         self.connect("destroy", self.on_destroy)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(18 * scale))
-        outer.set_border_width(int(32 * scale))
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(14 * scale))
+        outer.set_border_width(int(22 * scale))
         self.add(outer)
+        outer.pack_start(self.build_header(), False, False, 0)
 
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
-        brand = Gtk.Label()
-        brand.set_markup(
-            '<span foreground="#ffffff" size="xx-large" weight="bold">▣ LIBIAN '
-            '<span foreground="#5b9dff">TV</span></span>')
-        brand.set_xalign(0)
-        header.pack_start(brand, True, True, 0)
-        self.clock = Gtk.Label()
-        self.clock.get_style_context().add_class("clock")
-        header.pack_end(self.clock, False, False, 0)
-        outer.pack_start(header, False, False, 0)
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(22 * scale))
+        outer.pack_start(body, True, True, 0)
+        body.pack_start(self.build_sidebar(), False, False, 0)
 
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(10 * scale))
+        body.pack_start(right, True, True, 0)
         self.heading = Gtk.Label()
         self.heading.set_xalign(0)
         self.heading.get_style_context().add_class("title")
-        outer.pack_start(self.heading, False, False, 0)
-
+        right.pack_start(self.heading, False, False, 0)
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_transition_duration(120)
-        outer.pack_start(self.stack, True, True, 0)
+        right.pack_start(self.stack, True, True, 0)
 
-        for name, (_title, items) in PAGES.items():
-            self.stack.add_named(self.build_page(name, items), name)
+        self.titles = {"home": "", "wifi": "Red y Wi-Fi", "wifipass": "Contraseña de la red"}
+        self.add_page("home", self.build_home())
+        for name, (title, items) in PAGES.items():
+            self.titles[name] = title
+            self.add_page(name, self.build_grid_page(name, items))
+        self.add_page("wifi", self.build_wifi_page())
+        self.add_page("wifipass", self.build_password_page())
 
         self.status = Gtk.Label(label="")
         self.status.set_xalign(0)
@@ -218,92 +634,620 @@ class LibianTV(Gtk.Window):
         self.set_status_idle()
 
         self.update_clock()
-        GLib.timeout_add_seconds(20, self.update_clock)
-        self.show_page("main", push=False)
+        GLib.timeout_add_seconds(5, self.update_clock)
+        GLib.timeout_add_seconds(2, self.update_sys)
+        GLib.timeout_add_seconds(20, self.poll_net)
+        self.update_sys()
+        self.show_page("home", push=False)
+        GLib.timeout_add(1500, lambda: (self.poll_net(), False)[1])
 
-    # -- construcción ------------------------------------------------------
-    def build_page(self, name, items):
+    # -- piezas de la pantalla -----------------------------------------------
+    def build_header(self):
+        s = self.scale
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(16 * s))
+
+        logo = Gtk.DrawingArea()
+        logo.set_size_request(int(64 * s), int(56 * s))
+        logo.connect("draw", self.draw_logo)
+        header.pack_start(logo, False, False, 0)
+
+        brand_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        brand = Gtk.Label()
+        brand.set_markup('LIBIAN <span foreground="#5b9dff">TV</span>')
+        brand.set_xalign(0)
+        brand.get_style_context().add_class("brand")
+        tag = Gtk.Label(label="Ligero  ·  Debian  ·  Para todos")
+        tag.set_xalign(0)
+        tag.get_style_context().add_class("tagline")
+        brand_box.pack_start(brand, False, False, 0)
+        brand_box.pack_start(tag, False, False, 0)
+        header.pack_start(brand_box, False, False, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(26 * s))
+        header.pack_end(right, False, False, 0)
+
+        based = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        for text in ("Basado en Debian", "v" + VERSION):
+            lab = Gtk.Label(label=text)
+            lab.set_xalign(0)
+            lab.get_style_context().add_class("sys")
+            based.pack_start(lab, False, False, 0)
+        right.pack_start(based, False, False, 0)
+
+        clock_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.clock = Gtk.Label()
+        self.clock.get_style_context().add_class("clock")
+        self.date = Gtk.Label()
+        self.date.get_style_context().add_class("date")
+        clock_box.pack_start(self.clock, False, False, 0)
+        clock_box.pack_start(self.date, False, False, 0)
+        right.pack_start(clock_box, False, False, 0)
+
+        # Indicador de red: es un botón, abre la pantalla de Wi-Fi.
+        self.net_btn = Gtk.Button()
+        self.net_btn.get_style_context().add_class("appbtn")
+        self.net_label = Gtk.Label(label="◉ Red…")
+        self.net_label.get_style_context().add_class("sys")
+        self.net_btn.add(self.net_label)
+        self.net_btn.connect("clicked", lambda _b: self.show_page("wifi"))
+        right.pack_start(self.net_btn, False, False, 0)
+
+        sysbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.ram_label = Gtk.Label()
+        self.cpu_label = Gtk.Label()
+        for lab in (self.ram_label, self.cpu_label):
+            lab.set_xalign(0)
+            lab.get_style_context().add_class("sys")
+            sysbox.pack_start(lab, False, False, 0)
+        right.pack_start(sysbox, False, False, 0)
+        return header
+
+    def draw_logo(self, widget, cr):
+        if cairo is None:
+            return False
+        try:
+            w, h = widget.get_allocated_width(), widget.get_allocated_height()
+            grad = cairo.LinearGradient(0, 0, w, h)
+            grad.add_color_stop_rgb(0, 0.55, 0.30, 0.95)
+            grad.add_color_stop_rgb(1, 0.25, 0.55, 1.0)
+            cr.set_source(grad)
+            cr.set_line_width(max(3, w * 0.06))
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            # antenas
+            cr.move_to(w * 0.30, h * 0.05)
+            cr.line_to(w * 0.50, h * 0.26)
+            cr.line_to(w * 0.70, h * 0.05)
+            cr.stroke()
+            # cuerpo de la TV
+            x, y, bw, bh, rad = w * 0.06, h * 0.26, w * 0.88, h * 0.68, w * 0.14
+            cr.new_sub_path()
+            cr.arc(x + bw - rad, y + rad, rad, -1.5708, 0)
+            cr.arc(x + bw - rad, y + bh - rad, rad, 0, 1.5708)
+            cr.arc(x + rad, y + bh - rad, rad, 1.5708, 3.1416)
+            cr.arc(x + rad, y + rad, rad, 3.1416, 4.7124)
+            cr.close_path()
+            cr.stroke()
+            # botón de play
+            cr.move_to(w * 0.40, h * 0.42)
+            cr.line_to(w * 0.40, h * 0.78)
+            cr.line_to(w * 0.68, h * 0.60)
+            cr.close_path()
+            cr.fill()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def build_sidebar(self):
+        s = self.scale
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(6 * s))
+        box.set_size_request(int(230 * s), -1)
+        self.side_buttons = {}
+        for glyph, title, target in SIDEBAR:
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("side")
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(14 * s))
+            g = Gtk.Label(label=glyph)
+            t = Gtk.Label(label=title)
+            t.set_xalign(0)
+            row.pack_start(g, False, False, 0)
+            row.pack_start(t, True, True, 0)
+            btn.add(row)
+            btn.connect("clicked", self.on_side, target)
+            box.pack_start(btn, False, False, 0)
+            self.side_buttons[target] = btn
+        return box
+
+    def make_tile(self, glyph, title, desc, color, action):
+        s = self.scale
+        button = Gtk.Button()
+        ctx = button.get_style_context()
+        ctx.add_class("tile")
+        ctx.add_class("c-" + color)
+        button.set_size_request(int(190 * s), int(130 * s))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(4 * s))
+        g = Gtk.Label(label=glyph)
+        g.set_xalign(0)
+        g.get_style_context().add_class("glyph")
+        t = Gtk.Label(label=title)
+        t.set_xalign(0)
+        t.get_style_context().add_class("tile-title")
+        d = Gtk.Label(label=desc)
+        d.set_xalign(0)
+        d.set_line_wrap(True)
+        d.get_style_context().add_class("tile-desc")
+        box.pack_start(g, True, True, 0)
+        box.pack_start(t, False, False, 0)
+        box.pack_start(d, False, False, 0)
+        button.add(box)
+        button.connect("clicked", self.on_tile, title, action)
+        return button
+
+    def make_app_button(self, icons, glyph, title, action):
+        s = self.scale
+        button = Gtk.Button()
+        button.get_style_context().add_class("appbtn")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(4 * s))
+        theme = Gtk.IconTheme.get_default()
+        image = None
+        for name in icons:
+            if os.path.isabs(name) and os.path.exists(name):
+                try:
+                    size = int(52 * s)
+                    image = Gtk.Image.new_from_pixbuf(
+                        GdkPixbuf.Pixbuf.new_from_file_at_size(name, size, size))
+                    break
+                except GLib.Error:
+                    continue
+            if theme.has_icon(name):
+                image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.DIALOG)
+                image.set_pixel_size(int(52 * s))
+                break
+        if image is None:
+            image = Gtk.Label(label=glyph)
+            image.get_style_context().add_class("glyph")
+        lab = Gtk.Label(label=title)
+        lab.get_style_context().add_class("applabel")
+        box.pack_start(image, True, True, 0)
+        box.pack_start(lab, False, False, 0)
+        button.add(box)
+        button.set_size_request(int(100 * s), int(92 * s))
+        button.connect("clicked", self.on_tile, title, action)
+        return button
+
+    def scrolled(self, child):
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(child)
+        return sw
+
+    def add_page(self, name, widget):
+        self.stack.add_named(widget, name)
+
+    def build_home(self):
+        s = self.scale
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(14 * s))
+        tiles = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(14 * s))
+        tiles.set_homogeneous(True)
+        first = None
+        for glyph, title, desc, color, action, req in HOME_TILES:
+            if req and not shutil.which(req):
+                continue
+            btn = self.make_tile(glyph, title, desc, color, action)
+            tiles.pack_start(btn, True, True, 0)
+            first = first or btn
+        page.pack_start(tiles, False, False, 0)
+        self.focus_first["home"] = first
+
+        apps = []
+        for icons, glyph, title, action, req in APP_ROW:
+            if req and not shutil.which(req):
+                continue
+            if action[0] == "install" and not is_live():
+                continue
+            apps.append((icons, glyph, title, action))
+        vt = find_vacuumtube()
+        if vt:
+            desktop = vacuumtube_desktop()
+            icon = icon_from_desktop(desktop) if desktop else None
+            apps.insert(0, ([icon] if icon else [], "▶", "YouTube TV", ("youtube",)))
+        if apps:
+            lab = Gtk.Label(label="Mis aplicaciones")
+            lab.set_xalign(0)
+            lab.get_style_context().add_class("section")
+            page.pack_start(lab, False, False, 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(12 * s))
+            for icons, glyph, title, action in apps:
+                row.pack_start(self.make_app_button(icons, glyph, title, action), False, False, 0)
+            page.pack_start(row, False, False, 0)
+
+        games = [it for it in PAGES["games"][1] if shutil.which(it[5])]
+        if games:
+            lab = Gtk.Label(label="Juegos")
+            lab.set_xalign(0)
+            lab.get_style_context().add_class("section")
+            page.pack_start(lab, False, False, 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(12 * s))
+            for glyph, title, desc, color, action, _req in games:
+                tile = self.make_tile(glyph, title, desc, color, action)
+                tile.set_size_request(int(230 * s), int(100 * s))
+                row.pack_start(tile, False, False, 0)
+            page.pack_start(row, False, False, 0)
+        return self.scrolled(page)
+
+    def build_grid_page(self, name, items):
+        s = self.scale
         grid = Gtk.Grid()
-        grid.set_row_spacing(int(16 * self.scale))
-        grid.set_column_spacing(int(16 * self.scale))
-        grid.set_row_homogeneous(True)
+        grid.set_row_spacing(int(14 * s))
+        grid.set_column_spacing(int(14 * s))
         grid.set_column_homogeneous(True)
-        grid.set_valign(Gtk.Align.CENTER)
-
         visible = [it for it in items if it[5] is None or shutil.which(it[5])]
         if name == "apps" and not is_live():
             visible = [it for it in visible if it[4][0] != "install"]
+        if name == "apps":
+            vt = find_vacuumtube()
+            if vt:
+                visible.insert(0, ("▶", "YouTube TV", "App de YouTube para TV", "red",
+                                   ("youtube",), None))
         if not visible:
             label = Gtk.Label(label="No hay aplicaciones instaladas en esta sección.")
             label.get_style_context().add_class("subtitle")
             grid.attach(label, 0, 0, 1, 1)
-            self.first_tile[name] = None
+            self.focus_first[name] = None
             return grid
-
+        cols = 4 if len(visible) > 6 else 3
         for index, (glyph, title, desc, color, action, _req) in enumerate(visible):
-            button = Gtk.Button()
-            ctx = button.get_style_context()
-            ctx.add_class("tile")
-            ctx.add_class("c-" + color)
-            button.set_size_request(int(260 * self.scale), int(130 * self.scale))
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(4 * self.scale))
-            g = Gtk.Label(label=glyph)
-            g.set_xalign(0)
-            g.get_style_context().add_class("glyph")
-            t = Gtk.Label(label=title)
-            t.set_xalign(0)
-            t.get_style_context().add_class("tile-title")
-            d = Gtk.Label(label=desc)
-            d.set_xalign(0)
-            d.get_style_context().add_class("tile-desc")
-            box.pack_start(g, True, True, 0)
-            box.pack_start(t, False, False, 0)
-            box.pack_start(d, False, False, 0)
-            button.add(box)
-            button.connect("clicked", self.on_tile, title, action)
-            grid.attach(button, index % 3, index // 3, 1, 1)
+            button = self.make_tile(glyph, title, desc, color, action)
+            button.set_size_request(int(200 * s), int(120 * s))
+            grid.attach(button, index % cols, index // cols, 1, 1)
             if index == 0:
-                self.first_tile[name] = button
-        return grid
+                self.focus_first[name] = button
+        sw = self.scrolled(grid)
+        grid.set_focus_vadjustment(sw.get_vadjustment())
+        return sw
+
+    # -- Wi-Fi integrado ---------------------------------------------------------
+    def build_wifi_page(self):
+        s = self.scale
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(12 * s))
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(12 * s))
+        self.wifi_status = Gtk.Label(label="")
+        self.wifi_status.set_xalign(0)
+        self.wifi_status.set_line_wrap(True)
+        self.wifi_status.get_style_context().add_class("subtitle")
+        top.pack_start(self.wifi_status, True, True, 0)
+        self.btn_scan = Gtk.Button(label="↻ Buscar redes")
+        self.btn_scan.get_style_context().add_class("key")
+        self.btn_scan.connect("clicked", lambda _b: self.refresh_wifi(True))
+        self.btn_disc = Gtk.Button(label="Desconectar")
+        self.btn_disc.get_style_context().add_class("key")
+        self.btn_disc.connect("clicked", self.on_wifi_disconnect)
+        top.pack_end(self.btn_disc, False, False, 0)
+        top.pack_end(self.btn_scan, False, False, 0)
+        page.pack_start(top, False, False, 0)
+        self.wifi_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(8 * s))
+        sw = self.scrolled(self.wifi_list)
+        self.wifi_list.set_focus_vadjustment(sw.get_vadjustment())
+        page.pack_start(sw, True, True, 0)
+        self.focus_first["wifi"] = self.btn_scan
+        return page
+
+    def build_password_page(self):
+        s = self.scale
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(10 * s))
+        self.pw_label = Gtk.Label(label="")
+        self.pw_label.set_xalign(0)
+        self.pw_label.get_style_context().add_class("subtitle")
+        page.pack_start(self.pw_label, False, False, 0)
+        self.pw_entry = Gtk.Entry()
+        self.pw_entry.set_visibility(False)
+        self.pw_entry.get_style_context().add_class("pwentry")
+        self.pw_entry.set_can_focus(False)
+        page.pack_start(self.pw_entry, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(int(8 * s))
+        grid.set_column_spacing(int(8 * s))
+        grid.set_column_homogeneous(True)
+        self.osk_keys = []
+        first = None
+        for r, row in enumerate(OSK_ROWS):
+            for c, ch in enumerate(row):
+                btn = Gtk.Button(label=ch)
+                btn.get_style_context().add_class("key")
+                btn.connect("clicked", self.on_osk_key, ch)
+                grid.attach(btn, c, r, 1, 1)
+                self.osk_keys.append(btn)
+                first = first or btn
+        specials = [("⇧ Mayús", "shift", 0, 2), ("Espacio", "space", 2, 3),
+                    ("⌫ Borrar", "back", 5, 2), ("Ver / ocultar", "show", 7, 3)]
+        for label, key, col, span in specials:
+            btn = Gtk.Button(label=label)
+            btn.get_style_context().add_class("key")
+            btn.connect("clicked", self.on_osk_special, key)
+            grid.attach(btn, col, len(OSK_ROWS), span, 1)
+        cancel = Gtk.Button(label="✕ Cancelar")
+        cancel.get_style_context().add_class("key")
+        cancel.get_style_context().add_class("key-cancel")
+        cancel.connect("clicked", lambda _b: self.go_back())
+        ok = Gtk.Button(label="✓ Conectar")
+        ok.get_style_context().add_class("key")
+        ok.get_style_context().add_class("key-ok")
+        ok.connect("clicked", self.on_pw_connect)
+        grid.attach(cancel, 0, len(OSK_ROWS) + 1, 5, 1)
+        grid.attach(ok, 5, len(OSK_ROWS) + 1, 5, 1)
+        page.pack_start(grid, False, False, 0)
+        self.focus_first["wifipass"] = first
+        return self.scrolled(page)
+
+    @guarded
+    def refresh_wifi(self, rescan=False):
+        if self.wifi_busy:
+            return
+        self.wifi_busy = True
+        self.wifi_status.set_text("Buscando redes Wi-Fi…")
+
+        def work():
+            try:
+                st = net_status()
+                nets = wifi_networks(rescan) if st["has_wifi"] else []
+                known = known_connections() if st["has_wifi"] else set()
+            except Exception:  # noqa: BLE001
+                st, nets, known = self.net, [], set()
+            GLib.idle_add(self.fill_wifi, st, nets, known)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @guarded
+    def fill_wifi(self, st, nets, known):
+        self.wifi_busy = False
+        self.net = st
+        self.wifi_nets, self.wifi_known = nets, known
+        self.update_net_label()
+        for child in self.wifi_list.get_children():
+            self.wifi_list.remove(child)
+        if not st["has_wifi"]:
+            msg = "No se detectó una tarjeta Wi-Fi."
+            if st["ethernet"]:
+                msg += " Estás conectado por cable de red."
+            self.wifi_status.set_text(msg)
+        else:
+            if st["wifi"]:
+                self.wifi_status.set_text("Conectado a «%s»." % st["wifi"])
+            elif st["ethernet"]:
+                self.wifi_status.set_text("Conectado por cable. Wi-Fi sin conectar.")
+            else:
+                self.wifi_status.set_text("Sin conexión. Elige una red para conectarte.")
+            if not nets:
+                lab = Gtk.Label(label="No se encontraron redes. Pulsa «Buscar redes».")
+                lab.get_style_context().add_class("subtitle")
+                self.wifi_list.pack_start(lab, False, False, 0)
+        for net in nets:
+            if net["active"]:
+                tag = "Conectada"
+            elif net["ssid"] in known:
+                tag = "Guardada"
+            else:
+                tag = "Protegida" if net["secure"] else "Abierta"
+            btn = Gtk.Button()
+            ctx = btn.get_style_context()
+            ctx.add_class("netrow")
+            if net["active"]:
+                ctx.add_class("netrow-active")
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=int(16 * self.scale))
+            bars = Gtk.Label(label=signal_bars(net["signal"]))
+            name = Gtk.Label(label=net["ssid"])
+            name.set_xalign(0)
+            state = Gtk.Label(label=tag)
+            row.pack_start(bars, False, False, 0)
+            row.pack_start(name, True, True, 0)
+            row.pack_end(state, False, False, 0)
+            btn.add(row)
+            btn.connect("clicked", self.on_network, net)
+            self.wifi_list.pack_start(btn, False, False, 0)
+        self.wifi_list.show_all()
+        self.btn_disc.set_sensitive(bool(st["wifi"]))
+        return False
+
+    @guarded
+    def on_network(self, _btn, net):
+        if net["active"]:
+            self.wifi_status.set_text("Ya estás conectado a «%s»." % net["ssid"])
+            return
+        if net["secure"] and net["ssid"] not in self.wifi_known:
+            self.pending_ssid = net["ssid"]
+            self.pw_entry.set_text("")
+            self.pw_label.set_text("Escribe la contraseña de «%s» con el teclado en pantalla "
+                                   "(o con un teclado USB) y elige ✓ Conectar." % net["ssid"])
+            self.show_page("wifipass")
+        else:
+            self.connect_wifi(net["ssid"], None)
+
+    @guarded
+    def on_pw_connect(self, _btn=None):
+        if self.pending_ssid:
+            ssid, pw = self.pending_ssid, self.pw_entry.get_text()
+            self.go_back()
+            self.connect_wifi(ssid, pw or None)
+
+    def connect_wifi(self, ssid, password):
+        self.wifi_status.set_text("Conectando a «%s»…" % ssid)
+        self.announce("Conectando a %s…" % ssid)
+
+        def work():
+            try:
+                ok, msg = wifi_connect(ssid, password)
+            except Exception as exc:  # noqa: BLE001
+                ok, msg = False, str(exc)
+            GLib.idle_add(self.after_connect, ssid, ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @guarded
+    def after_connect(self, ssid, ok, msg):
+        if ok:
+            self.announce("Conectado a %s" % ssid)
+        else:
+            short = msg.splitlines()[-1] if msg else "no se pudo conectar"
+            self.announce("No se pudo conectar a %s: %s" % (ssid, short))
+        self.wifi_busy = False
+        self.refresh_wifi(False)
+        self.poll_net()
+        return False
+
+    @guarded
+    def on_wifi_disconnect(self, _btn):
+        dev = self.net.get("dev")
+
+        def work():
+            wifi_disconnect(dev)
+            GLib.idle_add(self.after_connect, "la red", True, "")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @guarded
+    def on_osk_key(self, _btn, ch):
+        if self.shift:
+            ch = ch.upper() if ch.isalpha() else ch
+        self.pw_entry.set_text(self.pw_entry.get_text() + ch)
+
+    @guarded
+    def on_osk_special(self, _btn, key):
+        text = self.pw_entry.get_text()
+        if key == "space":
+            self.pw_entry.set_text(text + " ")
+        elif key == "back":
+            self.pw_entry.set_text(text[:-1])
+        elif key == "shift":
+            self.shift = not self.shift
+            for btn in self.osk_keys:
+                label = btn.get_label()
+                btn.set_label(label.upper() if self.shift and label.isalpha() else label.lower()
+                              if label.isalpha() else label)
+        elif key == "show":
+            self.pw_visible = not self.pw_visible
+            self.pw_entry.set_visibility(self.pw_visible)
+
+    @guarded
+    def poll_net(self):
+        if self.net_busy:
+            return True
+        self.net_busy = True
+
+        def work():
+            try:
+                st = net_status()
+            except Exception:  # noqa: BLE001
+                st = self.net
+            GLib.idle_add(self.apply_net, st)
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    @guarded
+    def apply_net(self, st):
+        self.net_busy = False
+        self.net = st
+        self.update_net_label()
+        return False
+
+    def update_net_label(self):
+        st = self.net
+        if st["wifi"]:
+            text = "◉ %s %s" % (st["wifi"][:18], signal_bars(st["signal"]))
+        elif st["ethernet"]:
+            text = "◉ Cable"
+        elif st["has_wifi"]:
+            text = "◌ Sin conexión"
+        else:
+            text = "◌ Sin Wi-Fi"
+        self.net_label.set_text(text)
 
     # -- navegación ----------------------------------------------------------
+    @guarded
     def show_page(self, name, push=True):
-        if push:
-            self.history.append(self.stack.get_visible_child_name() or "main")
+        if push and self.current != name:
+            self.history.append(self.current)
+        self.current = name
         self.stack.set_visible_child_name(name)
-        self.heading.set_text(PAGES[name][0])
-        tile = self.first_tile.get(name)
+        self.heading.set_text(self.titles.get(name, ""))
+        self.heading.set_visible(bool(self.titles.get(name)))
+        for target, btn in self.side_buttons.items():
+            ctx = btn.get_style_context()
+            if target == name or (name in ("wifi", "wifipass") and target == "settings"):
+                ctx.add_class("side-active")
+            else:
+                ctx.remove_class("side-active")
+        if name == "wifi":
+            self.refresh_wifi(False)
+        tile = self.focus_first.get(name)
         if tile is not None:
             tile.grab_focus()
 
     def go_back(self):
         if self.history:
             self.show_page(self.history.pop(), push=False)
+        elif self.current != "home":
+            self.show_page("home", push=False)
 
+    @guarded
+    def on_side(self, _btn, target):
+        if target == "youtube":
+            self.open_youtube()
+        elif target == "home":
+            self.history.clear()
+            self.show_page("home", push=False)
+        else:
+            self.history = ["home"] if target != "home" else []
+            self.show_page(target, push=False)
+
+    @guarded
     def on_key(self, _window, event):
-        if event.keyval in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
+        key = event.keyval
+        if self.current == "wifipass":
+            if key == Gdk.KEY_Return or key == Gdk.KEY_KP_Enter:
+                if not isinstance(self.get_focus(), Gtk.Button):
+                    self.on_pw_connect()
+                    return True
+            elif key == Gdk.KEY_BackSpace:
+                self.pw_entry.set_text(self.pw_entry.get_text()[:-1])
+                return True
+            elif key != Gdk.KEY_Escape:
+                ch = Gdk.keyval_to_unicode(key)
+                if ch >= 32 and not (event.state & Gdk.ModifierType.CONTROL_MASK):
+                    self.pw_entry.set_text(self.pw_entry.get_text() + chr(ch))
+                    return True
+        if key in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
             self.go_back()
             return True
-        if event.keyval == Gdk.KEY_Home:
+        if key == Gdk.KEY_Home:
             self.history.clear()
-            self.show_page("main", push=False)
+            self.show_page("home", push=False)
             return True
         return False
 
     # -- acciones ------------------------------------------------------------
+    @guarded
     def on_tile(self, _button, title, action):
-        kind, value = action
+        kind = action[0]
+        value = action[1] if len(action) > 1 else None
         if kind == "page":
             self.show_page(value)
+        elif kind == "youtube":
+            self.open_youtube()
         elif kind == "web":
             self.announce("Abriendo %s…" % title)
-            self.launch(["firefox-esr", "--kiosk", value])
+            self.launch_managed(firefox_command(value), "browser")
         elif kind == "cmd":
             self.announce("Abriendo %s…" % title)
             self.launch(value)
         elif kind == "usb":
             self.announce("Abriendo USB…")
             self.launch(["thunar", usb_folder()])
+        elif kind == "wifi":
+            self.show_page("wifi")
+        elif kind == "vol":
+            self.volume(value)
         elif kind == "install":
             if self.confirm("¿Instalar LIBIAN TV en el disco duro?",
                             "Se abrirá el instalador. Revisa con cuidado el disco "
@@ -317,29 +1261,135 @@ class LibianTV(Gtk.Window):
             if self.confirm("¿%s el equipo?" % label, ""):
                 self.launch(["systemctl", value])
 
+    def open_youtube(self):
+        vt = find_vacuumtube()
+        if vt:
+            self.announce("Abriendo YouTube TV…")
+            self.launch_managed(vt, "basic")
+        elif shutil.which("firefox-esr"):
+            self.announce("Abriendo YouTube…")
+            self.launch_managed(firefox_command("https://www.youtube.com/"), "browser")
+        else:
+            self.message("No se pudo abrir YouTube", "No hay navegador ni YouTube TV instalados.")
+
+    def volume(self, value):
+        if value == "mute":
+            self.launch(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        else:
+            self.launch(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", value])
+        self.announce("Volumen ajustado")
+
     def launch(self, args):
         if shutil.which(args[0]) is None:
             self.message("No se pudo abrir la aplicación",
                          "No está instalado: %s" % args[0])
-            return
+            return None
         try:
-            subprocess.Popen(args, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+            return subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
         except OSError as exc:
             self.message("No se pudo abrir la aplicación", str(exc))
+            return None
 
+    # -- aplicaciones controladas (navegador, YouTube TV): barra para cerrar ---
+    def launch_managed(self, args, controls):
+        if self.app is not None and self.app.poll() is None:
+            self.close_app()
+        proc = self.launch(args)
+        if proc is None:
+            return
+        self.app, self.app_started = proc, time.time()
+        try:
+            with open(PIDFILE, "w", encoding="utf-8") as fh:
+                fh.write(str(proc.pid))
+        except OSError:
+            pass
+        self.bar = ControlBar(self, controls, self.scale)
+        self.bar.show_all()
+        self.bar.place()
+        GLib.timeout_add(500, self.watch_app)
+
+    @guarded
+    def watch_app(self):
+        proc = self.app
+        if proc is None:
+            return False
+        rc = proc.poll()
+        if rc is None:
+            return True
+        quick = (time.time() - self.app_started) < 4
+        self.finish_app()
+        if quick and rc not in (0, -signal.SIGTERM):
+            self.message("La aplicación se cerró al iniciar", "Código de salida: %s" % rc)
+        return False
+
+    def finish_app(self):
+        self.app = None
+        if self.bar is not None:
+            self.bar.close_bar()
+            self.bar = None
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass
+        self.present()
+
+    def close_app(self):
+        proc = self.app
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + 3
+        while time.time() < deadline and proc.poll() is None:
+            while Gtk.events_pending():
+                Gtk.main_iteration()
+            time.sleep(0.05)
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        self.finish_app()
+
+    @guarded
+    def bar_action(self, action):
+        if action == "close":
+            self.announce("Cerrando…")
+            GLib.idle_add(self.close_app)
+            return
+        keys = {"back": "alt+Left", "forward": "alt+Right", "reload": "F5",
+                "zoom_in": "ctrl+plus", "zoom_out": "ctrl+minus"}
+        key = keys.get(action)
+        if key and shutil.which("xdotool"):
+            subprocess.Popen(["xdotool", "key", "--clearmodifiers", key],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # -- estado, reloj, diálogos --------------------------------------------------
     def announce(self, text):
         self.status.set_text(text)
         GLib.timeout_add_seconds(6, self.set_status_idle)
 
     def set_status_idle(self):
-        self.status.set_text("LIBIAN TV  •  Flechas y Enter para moverte  •  "
-                             "Esc para volver")
+        self.status.set_text("LIBIAN TV  ·  Flechas y Enter para moverte  ·  "
+                             "Esc para volver  ·  Ctrl+Alt+Q cierra la app abierta")
         return False
 
+    @guarded
     def update_clock(self):
-        self.clock.set_text(time.strftime("%H:%M"))
+        tm = time.localtime()
+        self.clock.set_text(time.strftime("%H:%M", tm))
+        self.date.set_text(fmt_date(tm))
+        return True
+
+    @guarded
+    def update_sys(self):
+        used, total = read_mem()
+        self.ram_label.set_text(fmt_mem(used, total))
+        self.cpu_label.set_text("CPU: %d%%" % self.cpu.percent())
         return True
 
     def message(self, text, secondary):
@@ -361,7 +1411,43 @@ class LibianTV(Gtk.Window):
         return answer == Gtk.ResponseType.YES
 
     def on_destroy(self, _window):
+        if self.app is not None and self.app.poll() is None:
+            try:
+                os.killpg(self.app.pid, signal.SIGTERM)
+            except OSError:
+                pass
         Gtk.main_quit()
+
+    # -- autoprueba (solo con el parámetro de arranque libian.autotest) ----------
+    def autotest(self):
+        try:
+            for name in list(self.titles):
+                self.show_page(name, push=False)
+            self.pending_ssid = "Prueba"
+            self.on_osk_key(None, "a")
+            self.on_osk_special(None, "shift")
+            self.on_osk_key(None, "b")
+            self.on_osk_special(None, "back")
+            self.on_osk_special(None, "show")
+            nets = parse_wifi_list("*:Mi Red\\:5G:80:WPA2\n :Otra:30:--\n")
+            assert nets[0]["ssid"] == "Mi Red:5G" and nets[0]["active"], nets
+            assert nets[1]["secure"] is False, nets
+            net_status()
+            wifi_networks(False)
+            self.fill_wifi({"has_wifi": True, "wifi": "X", "ethernet": False, "signal": 60,
+                            "dev": "wlan0"}, nets, {"Otra"})
+            bar = ControlBar(self, "browser", self.scale)
+            bar.show_all()
+            bar.place()
+            bar.close_bar()
+            self.update_sys()
+            self.update_sys()
+            self.show_page("home", push=False)
+            log("LIBIAN-TV-AUTOTEST-OK")
+        except Exception:  # noqa: BLE001
+            syslog.syslog(syslog.LOG_ERR, "LIBIAN-TV-AUTOTEST-FAIL " +
+                          traceback.format_exc().replace("\n", " | "))
+        return False
 
 
 def main():
@@ -369,7 +1455,9 @@ def main():
     win.show_all()
 
     def ready():
-        syslog.syslog(syslog.LOG_INFO, "LIBIAN-TV-READY")
+        log("LIBIAN-TV-READY")
+        if cmdline_has("libian.autotest"):
+            GLib.timeout_add(1500, win.autotest)
         return False
 
     GLib.idle_add(ready)

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Cierra la aplicación (navegador, YouTube TV…) que abrió LIBIAN TV y vuelve al menú.
+# Atajos: Ctrl+Alt+Q o la tecla "Inicio" de teclados multimedia (XF86HomePage).
+pidfile="${XDG_RUNTIME_DIR:-/tmp}/libian-tv-app.pgid"
+[ -r "$pidfile" ] || exit 0
+pgid=$(cat "$pidfile" 2>/dev/null)
+case "$pgid" in ''|*[!0-9]*) exit 0 ;; esac
+kill -TERM -- "-$pgid" 2>/dev/null
+sleep 3
+kill -KILL -- "-$pgid" 2>/dev/null
+exit 0

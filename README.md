@@ -19,15 +19,19 @@ El flujo **falla si algo está mal** y deja el motivo en el resumen de la ejecuc
 | `scripts/preflight.sh` | Que `deb.debian.org/debian` (trixie, trixie-updates) y `security.debian.org/debian-security` (trixie-security) respondan y sean trixie; que **todos los paquetes existan**. Los opcionales inexistentes se omiten con aviso |
 | `lb build` + hook `0900-libian-selfcheck` | Que existan sesión, lanzador, LightDM, Firefox, VLC, Calamares…, que GTK importe y que los scripts compilen |
 | `scripts/verify-iso.sh` | ISO 9660 válida, MBR híbrido (USB), arranque BIOS/UEFI, kernel+initrd+squashfs, archivos clave dentro del sistema, repos `trixie`, `trixie-updates`, `trixie-security` configurados |
-| `scripts/smoke-test.sh` | **Arranca la ISO en QEMU con 3 GB de RAM**: captura del menú BIOS y espera a que la interfaz LIBIAN TV escriba `LIBIAN-TV-READY`. Captura en el artefacto `libian-tv-smoke-test` |
+| `scripts/smoke-test.sh` | **Arranca la ISO en QEMU con 3 GB de RAM**: captura del menú BIOS, espera a que la interfaz escriba `LIBIAN-TV-READY` y ejecuta una **autoprueba** que recorre todas las pantallas, el Wi-Fi, el teclado en pantalla y la barra de cierre (`LIBIAN-TV-AUTOTEST-OK`). Analiza los colores de la captura. Evidencia en el artefacto `libian-tv-smoke-test` |
 
 Si la prueba de arranque falla, la ISO igualmente se publica (es estructuralmente válida) pero el resumen avisa de que **no está confirmado que arranque**.
 
 ## Qué trae
 - **Sesión propia `libian-tv`**: solo `xfwm4` (sin compositor) + la interfaz. No se ve el escritorio XFCE. Si la interfaz se cierra, se relanza; si falla 3 veces seguidas abre una terminal de rescate.
 - **Inicio automático** (`libian-autologin.service`): en el Live entra solo como `user`; en el sistema instalado, con el primer usuario creado. Para desactivarlo: `sudo mkdir -p /etc/libian && sudo touch /etc/libian/no-autologin`.
-- **Menú**: YouTube · Streaming (YouTube modo TV [experimental], Netflix, Prime Video, Disney+, Max, Pluto TV, Twitch, Crunchyroll) · USB y Videos · Juegos · Aplicaciones (navegador, archivos, reproductor, terminal, instalador, escritorio XFCE) · Ajustes (red, sonido, pantalla, teclado, reiniciar, apagar). Teclado: flechas/Enter, `Esc` o `Retroceso` = volver.
-- Los accesos web se abren con Firefox ESR en modo kiosco (pantalla completa); `Alt+F4` vuelve al menú.
+- **Inicio estilo Smart TV**: barra lateral (Inicio, YouTube, Streaming, USB, Juegos, Aplicaciones, Ajustes), tarjetas grandes de colores, reloj y fecha, estado de red, uso de RAM y CPU en tiempo real, y filas «Mis aplicaciones» y «Juegos» con lo que realmente está instalado. Sin anuncios ni recomendaciones.
+- **Wi-Fi integrado en el menú** (sin abrir ventanas): lista de redes con intensidad de señal, conectar, desconectar, redes guardadas y **teclado en pantalla** para la contraseña (también sirve un teclado USB). Usa NetworkManager (`nmcli`).
+- **YouTube TV**: se instala **VacuumTube** (envoltorio MIT de la interfaz oficial de YouTube para TV, https://github.com/shy1132/VacuumTube) descargando su `.deb` durante la compilación. YouTube bloquea esa interfaz en navegadores normales, por eso hace falta esta app. Si no se pudiera descargar, el menú usa YouTube web en Firefox y la compilación lo avisa.
+- **Cerrar el navegador y las apps**: al abrir Firefox (en pantalla completa) o YouTube TV aparece arriba a la derecha una barra con **✕ Cerrar y volver al menú** (y, en el navegador, Atrás, Adelante, Recargar y zoom). También sirven **Ctrl+Alt+Q**, la tecla *Inicio* de teclados multimedia y `Alt+F4`.
+- **Menú**: YouTube · Streaming (Netflix, Prime Video, Disney+, Max, Pluto TV, Twitch, Crunchyroll) · USB · Juegos · Aplicaciones (navegador, archivos, reproductor, terminal, instalador, escritorio XFCE) · Ajustes (Wi-Fi, volumen, pantalla, teclado, reiniciar, apagar). Teclado: flechas/Enter, `Esc` o `Retroceso` = volver.
+- **Navegador**: Firefox ESR con perfil propio y uBlock Origin (si está disponible). No existe hoy un navegador «para TV» maduro y empaquetado en Debian (Plasma Bigscreen/Aura no tienen paquetes ni instalador).
 - **Bajo consumo de RAM**: zram (lz4), `swappiness` ajustado, sin compositor, servicios innecesarios desactivados (ModemManager, Bluetooth, temporizadores de apt), sin Kodi.
 - **Instalador**: Calamares (el de las imágenes live de Debian 13), botón *Aplicaciones → Instalar LIBIAN TV*.
 - Idioma `es_PE.UTF-8`, teclado `latam`, zona `America/Lima` (se cambian en `auto/config`).
@@ -35,6 +39,7 @@ Si la prueba de arranque falla, la ISO igualmente se publica (es estructuralment
 
 ## Limitaciones conocidas
 - Kernel 64 bits: sirve para CPU de 2008 con soporte x86-64 (Core 2, Phenom, etc.), no para Pentium 4 de 32 bits.
+- VacuumTube es un proyecto de terceros no oficial; es una app Electron y consume bastante RAM (usa su opción *Low Memory Mode* con `Ctrl+O` y filtra códecs si el video va entrecortado). No incluye aún configuración predefinida.
 - Netflix/Prime/Disney+/Max usan DRM (Widevine): Firefox ESR debe poder descargarlo; no está probado aquí. YouTube a 1080p en una CPU de 2008 puede ir justo; usa 480p/720p o `mpv <url>` con `yt-dlp`.
 - La instalación en disco está pensada para **BIOS/MBR** (PC de 2008). En UEFI puede requerir ajustes. Prueba el instalador primero en una VM.
 - Si instalas a disco, el instalador puede **borrar datos**: revisa el disco elegido.

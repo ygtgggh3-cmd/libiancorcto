@@ -5,6 +5,10 @@
 # RAM baja
 zram-tools
 
+# Bloqueador de anuncios en Firefox y fuentes con símbolos para el menú
+webext-ublock-origin-firefox
+fonts-freefont-ttf
+
 # Español
 firefox-esr-l10n-es-mx
 hunspell-es

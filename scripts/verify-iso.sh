@@ -36,6 +36,14 @@ for f in usr/local/bin/libian-tv usr/local/bin/libian-tv-session usr/share/xsess
          usr/bin/xfce4-terminal usr/bin/xfwm4 usr/bin/calamares usr/bin/python3; do
     grep -Fxq "squashfs-root/$f" "$WORK/sq.txt" && ok "sistema contiene /$f" || bad "sistema NO contiene /$f"
 done
+if grep -Eiq '^squashfs-root/opt/[^/]*vacuum[^/]*/' "$WORK/sq.txt" || grep -Eiq 'squashfs-root/usr/share/applications/.*vacuum.*\.desktop' "$WORK/sq.txt"; then
+    ok "VacuumTube (YouTube TV) incluido"
+else
+    warn "VacuumTube NO está en la imagen: el menú usará Firefox para YouTube"
+fi
+for f in usr/local/bin/libian-tv-close etc/libian/xbindkeysrc usr/bin/xdotool usr/bin/xbindkeys usr/bin/nmcli usr/bin/wpctl; do
+    grep -Fxq "squashfs-root/$f" "$WORK/sq.txt" && ok "sistema contiene /$f" || bad "sistema NO contiene /$f"
+done
 grep -Eq '^squashfs-root/lib/modules/[^/]+/kernel$|^squashfs-root/usr/lib/modules/[^/]+/kernel$' "$WORK/sq.txt" \
     && ok "módulos del kernel presentes" || bad "sin módulos del kernel"
 

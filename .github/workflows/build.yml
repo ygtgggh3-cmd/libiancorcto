@@ -28,6 +28,7 @@ jobs:
           for f in auto/config auto/clean scripts/*.sh \
                    config/hooks/live/*.hook.chroot \
                    config/includes.chroot/usr/local/bin/libian-tv-session \
+                   config/includes.chroot/usr/local/bin/libian-tv-close \
                    config/includes.chroot/usr/local/lib/libian/autologin.sh; do
             bash -n "$f" && echo "syntax ok: $f"
           done
@@ -35,6 +36,7 @@ jobs:
           chmod +x auto/config auto/clean scripts/*.sh config/hooks/live/*.hook.chroot \
                    config/includes.chroot/usr/local/bin/libian-tv \
                    config/includes.chroot/usr/local/bin/libian-tv-session \
+                   config/includes.chroot/usr/local/bin/libian-tv-close \
                    config/includes.chroot/usr/local/lib/libian/autologin.sh
 
       - name: Free disk space on the runner
@@ -44,12 +46,14 @@ jobs:
           df -h /
 
       - name: Build ISO inside Debian trixie (live-build)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "## LIBIAN TV: resultado de la compilación" >> "$GITHUB_STEP_SUMMARY"
           set -o pipefail
           sudo docker run --rm --privileged \
             -v "$PWD":/work -w /work \
-            -e GITHUB_STEP_SUMMARY=/work/summary.md \
+            -e GITHUB_STEP_SUMMARY=/work/summary.md -e GITHUB_TOKEN \
             debian:trixie bash scripts/build.sh 2>&1 | tee docker.log
           sudo chown -R "$(id -u):$(id -g)" . || true
 
@@ -106,6 +110,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-system-x86 imagemagick libarchive-tools xorriso
           if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
           bash scripts/smoke-test.sh output/libian-tv-amd64.iso smoke 1200
+
+      - name: Report smoke-test details (readable in annotations)
+        if: always()
+        run: |
+          if [ -f smoke/serial.log ]; then
+            msg=$(grep -E 'LIBIAN-TV|libian-tv-session' smoke/serial.log | tail -n 15 | cut -c1-500 | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::notice title=Prueba de arranque (marcas LIBIAN TV)::${msg:-sin marcas}"
+          fi
 
       - name: Upload smoke-test evidence
         if: always()

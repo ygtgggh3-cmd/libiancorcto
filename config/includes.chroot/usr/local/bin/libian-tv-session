@@ -18,6 +18,11 @@ xsetroot -solid '#05070b' 2>/dev/null
 xfsettingsd >/dev/null 2>&1 &
 xfwm4 --compositor=off >/dev/null 2>&1 &
 
+# Atajos globales (Ctrl+Alt+Q cierra la app abierta y vuelve al menú).
+if command -v xbindkeys >/dev/null 2>&1; then
+    xbindkeys -f /etc/libian/xbindkeysrc >/dev/null 2>&1 &
+fi
+
 # Audio: si PipeWire no se activó por socket, intenta arrancarlo.
 systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service \
     >/dev/null 2>&1 || true
@@ -30,6 +35,7 @@ while :; do
     if [ "$rc" -eq 42 ]; then
         pkill -u "$(id -u)" -x xfwm4 2>/dev/null
         pkill -u "$(id -u)" -x xfsettingsd 2>/dev/null
+        pkill -u "$(id -u)" -x xbindkeys 2>/dev/null
         exec startxfce4
     fi
     now=$(date +%s)

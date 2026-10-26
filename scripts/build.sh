@@ -21,6 +21,7 @@ scripts/preflight.sh
 
 lb clean --purge >/dev/null 2>&1 || true
 lb config
+scripts/fetch-vacuumtube.sh
 echo "== lb config =="; cat config/common 2>/dev/null | head -60 || true
 
 set +e
