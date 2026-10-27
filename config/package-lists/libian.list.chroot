@@ -46,6 +46,9 @@ mpv
 # Control desde el menú (cerrar/atrás/recargar en el navegador, atajos globales)
 xdotool
 xbindkeys
+wmctrl
+xinput
+pulseaudio-utils
 
 # Archivos y USB
 thunar

@@ -4,3 +4,10 @@
 
 "/usr/local/bin/libian-tv-close"
   XF86HomePage
+
+# Abrir/cerrar el menú de ajustes (además de pulsar Ctrl+Alt a secas)
+"/usr/local/bin/libian-tv-menu"
+    control+alt + m
+
+"/usr/local/bin/libian-tv-menu"
+    XF86Menu

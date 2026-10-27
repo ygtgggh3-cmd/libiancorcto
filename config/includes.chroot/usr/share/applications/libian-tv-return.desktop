@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Volver al menú de TV
+Comment=Cierra el escritorio y regresa a la interfaz de LIBIAN TV
+Exec=/usr/local/bin/libian-tv-return
+Icon=video-display
+Terminal=false
+Categories=Utility;System;

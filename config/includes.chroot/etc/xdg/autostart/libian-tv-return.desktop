@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Volver al menú de TV (botón)
+Exec=/usr/local/bin/libian-tv-return --button
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

@@ -1,6 +1,7 @@
 #!/bin/sh
 # LIBIAN TV: sesión mínima. Sin panel ni escritorio: solo gestor de ventanas
 # (xfwm4) y la interfaz de TV. Si la interfaz termina, se vuelve a lanzar.
+# Desde el menú se puede pasar al escritorio XFCE; al salir de él se vuelve aquí.
 export XDG_CURRENT_DESKTOP=XFCE
 export XDG_SESSION_DESKTOP=libian-tv
 export XDG_MENU_PREFIX=xfce-
@@ -13,15 +14,28 @@ xset -dpms 2>/dev/null
 xset s noblank 2>/dev/null
 xsetroot -solid '#05070b' 2>/dev/null
 
-# Servicios mínimos: ajustes de XFCE y gestor de ventanas sin compositor
-# (ahorra RAM y funciona mejor en gráficos antiguos).
-xfsettingsd >/dev/null 2>&1 &
-xfwm4 --compositor=off >/dev/null 2>&1 &
+start_tv_services() {
+    # Ajustes de XFCE y gestor de ventanas sin compositor (ahorra RAM).
+    xfsettingsd >/dev/null 2>&1 &
+    xfwm4 --compositor=off >/dev/null 2>&1 &
+    # Que las ventanas nuevas (apps, menú) reciban el foco sin trabas.
+    ( sleep 2; xfconf-query -c xfwm4 -p /general/prevent_focus_stealing -n -t bool -s false \
+        >/dev/null 2>&1 ) &
+    # Atajos extra: Ctrl+Alt+Q cierra la app, Ctrl+Alt+M / tecla Menú abren los ajustes.
+    # (Ctrl+Alt a secas lo detecta la propia interfaz.)
+    if command -v xbindkeys >/dev/null 2>&1; then
+        xbindkeys -f /etc/libian/xbindkeysrc >/dev/null 2>&1 &
+    fi
+}
 
-# Atajos globales (Ctrl+Alt+Q cierra la app abierta y vuelve al menú).
-if command -v xbindkeys >/dev/null 2>&1; then
-    xbindkeys -f /etc/libian/xbindkeysrc >/dev/null 2>&1 &
-fi
+stop_tv_services() {
+    for p in xfwm4 xfsettingsd xbindkeys; do
+        pkill -u "$(id -u)" -x "$p" 2>/dev/null
+    done
+    sleep 1
+}
+
+start_tv_services
 
 # Audio: si PipeWire no se activó por socket, intenta arrancarlo.
 systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service \
@@ -33,10 +47,19 @@ while :; do
     /usr/local/bin/libian-tv
     rc=$?
     if [ "$rc" -eq 42 ]; then
-        pkill -u "$(id -u)" -x xfwm4 2>/dev/null
-        pkill -u "$(id -u)" -x xfsettingsd 2>/dev/null
-        pkill -u "$(id -u)" -x xbindkeys 2>/dev/null
-        exec startxfce4
+        # Escritorio XFCE como proceso hijo: al cerrar sesión en XFCE (o con el
+        # botón "Volver al menú de TV") se regresa a la interfaz de TV.
+        stop_tv_services
+        startxfce4
+        logger -t libian-tv-session "escritorio XFCE terminado; volviendo a la TV" 2>/dev/null
+        for p in xfce4-session xfdesktop xfce4-panel Thunar; do
+            pkill -u "$(id -u)" -x "$p" 2>/dev/null
+        done
+        pkill -u "$(id -u)" -f libian-tv-return 2>/dev/null
+        stop_tv_services
+        start_tv_services
+        fast_failures=0
+        continue
     fi
     now=$(date +%s)
     if [ $((now - start)) -lt 5 ]; then

@@ -24,11 +24,12 @@ jobs:
       - name: Validate project files (fast fail)
         run: |
           set -e
-          python3 -m py_compile config/includes.chroot/usr/local/bin/libian-tv
+          python3 -m py_compile config/includes.chroot/usr/local/bin/libian-tv config/includes.chroot/usr/local/bin/libian-tv-return
           for f in auto/config auto/clean scripts/*.sh \
                    config/hooks/live/*.hook.chroot \
                    config/includes.chroot/usr/local/bin/libian-tv-session \
                    config/includes.chroot/usr/local/bin/libian-tv-close \
+                   config/includes.chroot/usr/local/bin/libian-tv-menu \
                    config/includes.chroot/usr/local/lib/libian/autologin.sh; do
             bash -n "$f" && echo "syntax ok: $f"
           done
@@ -37,6 +38,8 @@ jobs:
                    config/includes.chroot/usr/local/bin/libian-tv \
                    config/includes.chroot/usr/local/bin/libian-tv-session \
                    config/includes.chroot/usr/local/bin/libian-tv-close \
+                   config/includes.chroot/usr/local/bin/libian-tv-menu \
+                   config/includes.chroot/usr/local/bin/libian-tv-return \
                    config/includes.chroot/usr/local/lib/libian/autologin.sh
 
       - name: Free disk space on the runner

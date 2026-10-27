@@ -6,9 +6,11 @@ Códigos de salida (los usa /usr/local/bin/libian-tv-session):
     0  -> la ventana se cerró: la sesión vuelve a lanzar la interfaz
     42 -> el usuario pidió el escritorio XFCE completo
 """
+import collections
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -31,7 +33,7 @@ try:
 except ImportError:  # el logo se dibuja solo si hay cairo
     cairo = None
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 EXIT_DESKTOP = 42
 syslog.openlog("libian-tv")
 
@@ -306,19 +308,26 @@ VACUUMTUBE_DEFAULTS = {
     "device_discoverability": False,  # sin servicio DIAL en segundo plano
     "auto_update": False,             # no actualizarse solo (la ISO ya trae una versión)
     "touch_overlay": False,
+    "fullscreen": True,               # como una tele: pantalla completa
 }
 
 
 def vacuumtube_prepare():
-    """Crea config.json con ajustes ligeros solo si no existe (no pisa lo que elija el usuario)."""
+    """Crea config.json con ajustes ligeros si no existe; si existe solo fuerza pantalla completa."""
     try:
         if os.path.exists(VACUUMTUBE_CONFIG):
+            with open(VACUUMTUBE_CONFIG, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data.get("fullscreen") is not True:
+                data["fullscreen"] = True
+                with open(VACUUMTUBE_CONFIG, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=4)
             return False
         os.makedirs(os.path.dirname(VACUUMTUBE_CONFIG), exist_ok=True)
         with open(VACUUMTUBE_CONFIG, "w", encoding="utf-8") as fh:
             json.dump(VACUUMTUBE_DEFAULTS, fh, indent=4)
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -358,6 +367,377 @@ def firefox_command(url):
     except OSError:
         pass
     return ["firefox-esr", "--no-remote", "--profile", FIREFOX_PROFILE, "--kiosk", url]
+
+
+# ---------------------------------------------------------------------------
+# Ajustes del sistema (menú tipo Batocera): pantalla, audio, teclado, USB…
+# ---------------------------------------------------------------------------
+SETTINGS_FILE = os.path.expanduser("~/.config/libian-tv/settings.json")
+LAUNCHER_PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "libian-tv.pid")
+ROTATIONS = [("normal", "Normal"), ("left", "Izquierda"), ("right", "Derecha"),
+             ("inverted", "Invertida")]
+KEYBOARD_LAYOUTS = [("latam", "Latinoamérica"), ("es", "España"), ("us", "Inglés (EE. UU.)"),
+                    ("gb", "Inglés (Reino Unido)"), ("br", "Portugués (Brasil)"),
+                    ("pt", "Portugués"), ("fr", "Francés"), ("de", "Alemán"), ("it", "Italiano")]
+TIMEZONES = ["America/Lima", "America/Bogota", "America/Guayaquil", "America/La_Paz",
+             "America/Santiago", "America/Argentina/Buenos_Aires", "America/Caracas",
+             "America/Mexico_City", "America/Panama", "America/New_York", "Europe/Madrid", "UTC"]
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(patch):
+    data = load_settings()
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(data.get(key), dict):
+            data[key].update(value)
+        else:
+            data[key] = value
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except OSError:
+        pass
+
+
+# -- pantalla (xrandr) -------------------------------------------------------
+def parse_xrandr(text):
+    outputs, cur = [], None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            m = re.match(r"^(\S+) (connected|disconnected)", line)
+            if not m:
+                cur = None
+                continue
+            rot = re.search(r"\d+x\d+\+\d+\+\d+ (left|right|inverted)", line)
+            cur = {"name": m.group(1), "connected": m.group(2) == "connected",
+                   "res": None, "rate": None, "rotation": rot.group(1) if rot else "normal",
+                   "modes": {}}
+            outputs.append(cur)
+            continue
+        m = re.match(r"^\s+(\d+x\d+)i?\s+(.+)$", line)
+        if m and cur is not None:
+            res, rates = m.group(1), cur["modes"].setdefault(m.group(1), [])
+            for tok in m.group(2).split():
+                clean = tok.replace("*", "").replace("+", "")
+                try:
+                    float(clean)
+                except ValueError:
+                    continue
+                if clean not in rates:
+                    rates.append(clean)
+                if "*" in tok:
+                    cur["res"], cur["rate"] = res, clean
+    return outputs
+
+
+def xrandr_info():
+    rc, out, _err = run(["xrandr", "--query"], 10)
+    return parse_xrandr(out) if rc == 0 else []
+
+
+def mode_area(res):
+    try:
+        w, h = res.split("x")
+        return int(w) * int(h)
+    except ValueError:
+        return 0
+
+
+def xrandr_apply(output, mode=None, rate=None, rotate=None, brightness=None, auto=False):
+    args = ["xrandr", "--output", output]
+    if auto:
+        args += ["--auto"]
+    if mode:
+        args += ["--mode", mode]
+        if rate:
+            args += ["--rate", rate]
+    if rotate:
+        args += ["--rotate", rotate]
+    if brightness is not None:
+        args += ["--brightness", "%.2f" % brightness]
+    return run(args, 25)[0] == 0
+
+
+# -- teclado -----------------------------------------------------------------
+def keyboard_current():
+    rc, out, _err = run(["setxkbmap", "-query"], 5)
+    for line in out.splitlines():
+        if line.startswith("layout:"):
+            return line.split(":", 1)[1].strip().split(",")[0]
+    return ""
+
+
+def keyboard_set(layout):
+    return run(["setxkbmap", "-layout", layout], 8)[0] == 0
+
+
+def apply_saved_settings():
+    """Reaplica pantalla y teclado guardados (se llama al arrancar la interfaz)."""
+    saved = load_settings()
+    try:
+        if saved.get("keyboard") and shutil.which("setxkbmap"):
+            keyboard_set(saved["keyboard"])
+        disp = saved.get("display")
+        if disp and shutil.which("xrandr"):
+            xrandr_apply(disp.get("output"), disp.get("mode"), disp.get("rate"),
+                         disp.get("rotate"), disp.get("brightness"))
+    except Exception:  # noqa: BLE001
+        syslog.syslog(syslog.LOG_ERR, "LIBIAN-TV-ERROR apply_saved_settings " +
+                      traceback.format_exc().replace("\n", " | "))
+
+
+# -- audio (pactl, vía PipeWire) -------------------------------------------------
+def audio_sinks():
+    rc, out, _err = run(["pactl", "list", "sinks"], 8)
+    sinks, cur = [], None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("Name:"):
+            cur = {"name": s[5:].strip(), "desc": ""}
+            sinks.append(cur)
+        elif s.startswith("Description:") and cur is not None:
+            cur["desc"] = s[12:].strip()
+    default = run(["pactl", "get-default-sink"], 5)[1].strip()
+    return sinks, default
+
+
+def audio_volume():
+    m = re.search(r"(\d+)%", run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], 5)[1])
+    return int(m.group(1)) if m else 0
+
+
+def audio_muted():
+    return "yes" in run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"], 5)[1].lower()
+
+
+def audio_set_volume(percent):
+    run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "%d%%" % percent], 5)
+
+
+def audio_set_mute(muted):
+    run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if muted else "0"], 5)
+
+
+def audio_set_default(name):
+    run(["pactl", "set-default-sink", name], 5)
+    rc, out, _err = run(["pactl", "list", "short", "sink-inputs"], 5)
+    for line in out.splitlines():
+        if line.split():
+            run(["pactl", "move-sink-input", line.split()[0], name], 5)
+
+
+# -- zona horaria, Wi-Fi, almacenamiento, información -------------------------------
+def timezone_current():
+    rc, out, _err = run(["timedatectl", "show", "-p", "Timezone", "--value"], 5)
+    if rc == 0 and out.strip():
+        return out.strip()
+    try:
+        with open("/etc/timezone", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def wifi_radio_enabled():
+    return run(["nmcli", "radio", "wifi"], 5)[1].strip() == "enabled"
+
+
+def removable_partitions():
+    """Lista de memorias USB montadas: [{'path','label','size','mount','disk'}]."""
+    rc, out, _err = run(["lsblk", "-J", "-o", "NAME,PATH,HOTPLUG,MOUNTPOINT,LABEL,SIZE,TYPE"], 10)
+    if rc != 0:
+        return []
+    try:
+        devices = json.loads(out).get("blockdevices", [])
+    except ValueError:
+        return []
+    found = []
+    for disk in devices:
+        if disk.get("hotplug") not in (True, 1, "1", "true"):
+            continue
+        parts = [c for c in disk.get("children", []) or []] or [disk]
+        for part in parts:
+            if part.get("mountpoint"):
+                found.append({"path": part.get("path"), "label": part.get("label") or part.get("name"),
+                              "size": part.get("size") or "", "mount": part.get("mountpoint"),
+                              "disk": disk.get("path")})
+    return found
+
+
+def system_info():
+    rows = []
+    pretty = "Debian GNU/Linux"
+    try:
+        with open("/etc/os-release", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PRETTY_NAME="):
+                    pretty = line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    rows.append(("Sistema", pretty))
+    rows.append(("LIBIAN TV", "v" + VERSION))
+    rows.append(("Kernel", os.uname().release))
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            text = fh.read()
+        model = re.search(r"model name\s*:\s*(.+)", text)
+        cores = len(re.findall(r"^processor\s*:", text, re.M))
+        rows.append(("Procesador", "%s (%d núcleos)" % (
+            re.sub(r"\s+", " ", model.group(1)).strip() if model else "desconocido", cores)))
+    except OSError:
+        pass
+    try:
+        used, total = read_mem()
+        rows.append(("Memoria RAM", "%d MB usados de %d MB" % (used, total)))
+    except (OSError, ValueError):
+        pass
+    try:
+        du = shutil.disk_usage("/")
+        rows.append(("Disco (/)", "%.1f GB libres de %.1f GB" % (du.free / 1e9, du.total / 1e9)))
+    except OSError:
+        pass
+    ips = run(["hostname", "-I"], 5)[1].split()
+    rows.append(("Dirección IP", ips[0] if ips else "sin conexión"))
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            secs = int(float(fh.read().split()[0]))
+        rows.append(("Tiempo encendido", "%d h %d min" % (secs // 3600, secs % 3600 // 60)))
+    except (OSError, ValueError):
+        pass
+    for out in xrandr_info():
+        if out["connected"] and out["res"]:
+            rows.append(("Pantalla", "%s  %s @ %s Hz" % (out["name"], out["res"], out["rate"] or "?")))
+            break
+    ver = run(["dpkg-query", "-W", "-f", "${Version}", "vacuumtube"], 5)
+    if ver[0] == 0 and ver[1].strip():
+        rows.append(("YouTube TV (VacuumTube)", ver[1].strip()))
+    return rows
+
+
+# -- ventanas: pantalla completa automática para las apps --------------------------
+def wm_windows():
+    rc, out, _err = run(["wmctrl", "-l"], 4)
+    wins = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 3:
+            wins[parts[0]] = parts[3] if len(parts) > 3 else ""
+    return wins
+
+
+def fullscreen_new_windows(before, seconds=14, limit=2):
+    """Pone en pantalla completa las primeras ventanas nuevas (las de la app recién abierta)."""
+    skip = ("LIBIAN TV", "Menú LIBIAN TV")
+    seen, done = set(before), 0
+    deadline = time.time() + seconds
+    while time.time() < deadline and done < limit:
+        time.sleep(0.4)
+        for wid, title in wm_windows().items():
+            if wid in seen:
+                continue
+            seen.add(wid)
+            if title in skip:
+                continue
+            run(["wmctrl", "-i", "-r", wid, "-b", "add,fullscreen"], 4)
+            done += 1
+
+
+# -- atajos globales sin "robar" teclas: se escuchan con xinput -----------------------
+class KeyLogic:
+    """Detecta: Ctrl+Alt pulsadas solas (menú) y 5 veces Esc seguidas (salir de la app)."""
+    ESC = 9
+    CTRL = (37, 105)
+    ALT = (64, 108)
+
+    def __init__(self, presses=5, window_ms=4000, repeat_ms=90):
+        self.down, self.armed = set(), False
+        self.esc, self.last_esc = [], -10 ** 9
+        self.seen = collections.deque(maxlen=64)
+        self.presses, self.window, self.repeat = presses, window_ms, repeat_ms
+
+    def feed(self, etype, code, t):
+        key = (etype, code, t)
+        if key in self.seen:           # el mismo evento llega por el teclado maestro y el físico
+            return []
+        self.seen.append(key)
+        out = []
+        mods = self.CTRL + self.ALT
+        if etype == 2:                 # KeyPress
+            if code in mods:
+                self.down.add(code)
+                if (any(c in self.down for c in self.CTRL)
+                        and any(c in self.down for c in self.ALT)):
+                    self.armed = True
+            else:
+                self.armed = False
+                if code == self.ESC:
+                    if t - self.last_esc >= self.repeat:     # ignora la repetición automática
+                        self.esc = [x for x in self.esc if t - x <= self.window] + [t]
+                        if len(self.esc) >= self.presses:
+                            self.esc = []
+                            out.append("escape5")
+                    self.last_esc = t
+        elif etype == 3:               # KeyRelease
+            if code in mods:
+                self.down.discard(code)
+                if self.armed:
+                    self.armed = False
+                    out.append("ctrlalt")
+        return out
+
+
+def parse_xi2(lines):
+    """Convierte la salida de `xinput test-xi2 --root` en (tipo, tecla, tiempo)."""
+    etype = t = None
+    for line in lines:
+        s = line.strip()
+        m = re.match(r"EVENT type (\d+)", s)
+        if m:
+            etype, t = int(m.group(1)), None
+        elif s.startswith("time:"):
+            try:
+                t = int(s.split(":", 1)[1])
+            except ValueError:
+                t = None
+        elif s.startswith("detail:") and etype in (2, 3):
+            try:
+                yield etype, int(s.split(":", 1)[1]), (t if t is not None else 0)
+            except ValueError:
+                pass
+            etype = None
+
+
+class KeyWatcher(threading.Thread):
+    def __init__(self, callback):
+        super().__init__(daemon=True)
+        self.callback = callback
+        self.logic = KeyLogic()
+
+    def run(self):
+        while True:
+            try:
+                proc = subprocess.Popen(["stdbuf", "-oL", "xinput", "test-xi2", "--root"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                        universal_newlines=True)
+            except OSError:
+                return
+            try:
+                for etype, code, t in parse_xi2(proc.stdout):
+                    for event in self.logic.feed(etype, code, t):
+                        self.callback(event)
+            except Exception:  # noqa: BLE001
+                pass
+            proc.wait()
+            time.sleep(3)
 
 
 # ---------------------------------------------------------------------------
@@ -525,9 +905,18 @@ button {{ background-image: none; box-shadow: none; text-shadow: none; }}
            border-radius: {sr}px; padding: {kp}px {sp}px; font-size: {sm}px; }}
 .barbtn:hover {{ border-color: #ffffff; }}
 .barclose {{ background-color: #c0212f; font-weight: bold; }}
+.bmenu-bg {{ background-color: #0b0f17; }}
+.bmenu-title {{ color: #ffffff; font-size: {bt}px; font-weight: bold; }}
+.brow {{ background-color: #151c2b; border-radius: {sr}px; padding: {sp}px {sp2}px;
+         border: 3px solid transparent; }}
+.brow-label {{ color: #e7edf8; font-size: {sf}px; }}
+.brow-value {{ color: #8fb4ff; font-size: {sf}px; }}
+.brow-sel {{ background-color: #1f5fe0; border-color: #ffffff; }}
+.brow-sel label {{ color: #ffffff; font-weight: bold; }}
+.bmenu-hint {{ color: #7f8ba3; font-size: {sm}px; }}
 """.format(r=px(16), t=px(30), sec=px(24), c=px(30), s=px(15), sm=px(13), b=px(40),
            p=px(12), g=px(44), tt=px(22), td=px(14), sr=px(12), sp=px(10), sp2=px(14),
-           sf=px(18), kp=px(8))
+           sf=px(18), kp=px(8), bt=px(34))
     for name, (light, dark) in COLORS.items():
         if gradients:
             css += (".c-%s {background-image: linear-gradient(135deg, %s, %s);}\n"
@@ -591,6 +980,467 @@ class ControlBar(Gtk.Window):
 
 
 # ---------------------------------------------------------------------------
+# Menú de sistema estilo Batocera (se abre con Ctrl+Alt, incluso sobre una app)
+# ---------------------------------------------------------------------------
+class SystemMenu(Gtk.Window):
+    def __init__(self, tv):
+        super().__init__(title="Menú LIBIAN TV")
+        self.tv = tv
+        self.stack = []          # [(titulo, constructor_de_filas)]
+        self.memory = {}
+        self.sel = 0
+        self.items = []
+        self.armed = None
+        self.pending = None      # confirmación de cambio de pantalla
+        self.tick_id = 0
+        s = tv.scale
+        screen = Gdk.Screen.get_default()
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_default_size(screen.get_width(), screen.get_height())
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", lambda *_a: self.close_menu() or True)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.get_style_context().add_class("bmenu-bg")
+        self.add(outer)
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(8 * s))
+        column.set_size_request(int(820 * s), -1)
+        column.set_halign(Gtk.Align.CENTER)
+        column.set_valign(Gtk.Align.CENTER)
+        outer.pack_start(column, True, True, 0)
+        self.title = Gtk.Label()
+        self.title.get_style_context().add_class("bmenu-title")
+        column.pack_start(self.title, False, False, int(10 * s))
+        self.rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=int(6 * s))
+        column.pack_start(self.rows_box, False, False, 0)
+        self.hint = Gtk.Label()
+        self.hint.get_style_context().add_class("bmenu-hint")
+        column.pack_start(self.hint, False, False, int(10 * s))
+        self.rows = []
+
+    # -- apertura y cierre ---------------------------------------------------
+    def open_menu(self):
+        self.stack = [("Menú", self.page_main)]
+        self.sel = 0
+        self.armed = None
+        self.refresh()
+        self.fullscreen()
+        self.show_all()
+        self.present()
+        win = self.get_window()
+        if win is not None:
+            win.focus(Gdk.CURRENT_TIME)
+        if shutil.which("wmctrl"):
+            run(["wmctrl", "-r", "Menú LIBIAN TV", "-b", "add,above"], 3)
+
+    def close_menu(self):
+        if self.pending:
+            self.revert_display()
+        self.hide()
+        self.tv.menu_closed()
+
+    def is_open(self):
+        return self.get_visible()
+
+    # -- dibujo de filas ---------------------------------------------------------
+    def refresh(self):
+        name, builder = self.stack[-1]
+        self.items = builder()
+        if self.sel >= len(self.items):
+            self.sel = max(len(self.items) - 1, 0)
+        for child in self.rows_box.get_children():
+            self.rows_box.remove(child)
+        self.rows = []
+        self.title.set_text(name)
+        for item in self.items:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            row.get_style_context().add_class("brow")
+            label = Gtk.Label(label=item["label"])
+            label.set_xalign(0)
+            label.get_style_context().add_class("brow-label")
+            row.pack_start(label, True, True, 0)
+            value = item.get("value", "")
+            if item.get("fn") and item.get("arrows"):
+                value = "◀  %s  ▶" % value
+            elif item.get("sub"):
+                value = (value + "  ›") if value else "›"
+            val = Gtk.Label(label=value)
+            val.set_xalign(1)
+            val.get_style_context().add_class("brow-value")
+            row.pack_end(val, False, False, 0)
+            self.rows_box.pack_start(row, False, False, 0)
+            self.rows.append(row)
+        self.mark()
+        self.hint.set_text("↑↓ moverse   ←→ cambiar   Enter elegir   Esc volver   "
+                           "Ctrl+Alt cerrar el menú")
+        self.rows_box.show_all()
+
+    def mark(self):
+        for i, row in enumerate(self.rows):
+            ctx = row.get_style_context()
+            if i == self.sel:
+                ctx.add_class("brow-sel")
+            else:
+                ctx.remove_class("brow-sel")
+
+    def push(self, title, builder):
+        self.memory[self.stack[-1][0]] = self.sel
+        self.stack.append((title, builder))
+        self.sel = 0
+        self.armed = None
+        self.refresh()
+
+    def pop(self):
+        if len(self.stack) <= 1:
+            self.close_menu()
+            return
+        self.stack.pop()
+        self.sel = self.memory.get(self.stack[-1][0], 0)
+        self.armed = None
+        self.refresh()
+
+    @guarded
+    def on_key(self, _w, event):
+        key = event.keyval
+        if key in (Gdk.KEY_Up, Gdk.KEY_KP_Up):
+            self.sel = (self.sel - 1) % max(len(self.items), 1)
+            self.armed = None
+            self.mark()
+        elif key in (Gdk.KEY_Down, Gdk.KEY_KP_Down):
+            self.sel = (self.sel + 1) % max(len(self.items), 1)
+            self.armed = None
+            self.mark()
+        elif key in (Gdk.KEY_Left, Gdk.KEY_KP_Left):
+            self.activate(-1)
+        elif key in (Gdk.KEY_Right, Gdk.KEY_KP_Right):
+            self.activate(1)
+        elif key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.activate(0)
+        elif key in (Gdk.KEY_Escape, Gdk.KEY_BackSpace):
+            if self.pending:
+                self.revert_display()
+                self.pop()
+            else:
+                self.pop()
+        else:
+            return False
+        return True
+
+    def activate(self, direction):
+        if not self.items:
+            return
+        item = self.items[self.sel]
+        fn = item.get("fn")
+        if fn is None:
+            return
+        if direction != 0 and not (item.get("arrows") or item.get("sub")):
+            return
+        if direction != 0 and item.get("sub"):
+            return
+        try:
+            fn(direction)
+        except Exception:  # noqa: BLE001
+            syslog.syslog(syslog.LOG_ERR, "LIBIAN-TV-ERROR menu %s" %
+                          traceback.format_exc().replace("\n", " | "))
+        if self.get_visible() and self.stack:
+            self.refresh()
+
+    # -- filas auxiliares ---------------------------------------------------------
+    def info_row(self, label, value):
+        return {"label": label, "value": value}
+
+    def sub_row(self, label, title, builder, value=""):
+        return {"label": label, "value": value, "sub": True,
+                "fn": lambda d: self.push(title, builder) if d == 0 else None}
+
+    def cycle(self, options, current, direction):
+        """Valor siguiente/anterior de una lista (o el siguiente con Enter)."""
+        if not options:
+            return None
+        try:
+            i = options.index(current)
+        except ValueError:
+            i = 0
+        step = -1 if direction < 0 else 1
+        return options[(i + step) % len(options)]
+
+    # -- páginas --------------------------------------------------------------------
+    def page_main(self):
+        items = [
+            self.sub_row("Información del sistema", "Información del sistema", self.page_info),
+            self.sub_row("Pantalla", "Pantalla", self.page_display),
+            self.sub_row("Sonido", "Sonido", self.page_sound),
+            self.sub_row("Red y Wi-Fi", "Red y Wi-Fi", self.page_network),
+            self.sub_row("Teclado", "Teclado", self.page_keyboard),
+            self.sub_row("Zona horaria", "Zona horaria", self.page_timezone),
+            self.sub_row("Almacenamiento USB", "Almacenamiento USB", self.page_storage),
+        ]
+        if self.tv.apps_running():
+            items.append(self.sub_row("Aplicación abierta", "Aplicación abierta", self.page_app))
+        items += [self.sub_row("Energía", "Energía", self.page_power),
+                  self.sub_row("Acerca de LIBIAN TV", "Acerca de LIBIAN TV", self.page_about),
+                  {"label": "Cerrar menú", "value": "", "fn": lambda d: self.close_menu()
+                   if d == 0 else None}]
+        return items
+
+    def page_info(self):
+        return [self.info_row(k, v) for k, v in system_info()]
+
+    def page_about(self):
+        return [self.info_row("LIBIAN TV", "versión " + VERSION),
+                self.info_row("Base", "Debian 13 «trixie» (64 bits)"),
+                self.info_row("Escritorio", "XFCE (opcional)"),
+                self.info_row("Atajos", "Ctrl+Alt: menú"),
+                self.info_row("", "Esc ×5: cerrar app"),
+                self.info_row("", "Ctrl+Alt+Q: cerrar app")]
+
+    # pantalla
+    def display_output(self):
+        for out in xrandr_info():
+            if out["connected"]:
+                return out
+        return None
+
+    def page_display(self):
+        out = self.display_output()
+        if out is None:
+            return [self.info_row("Pantalla", "no se detectó ninguna")]
+        saved = load_settings().get("display", {})
+        bright = saved.get("brightness", 1.0)
+        modes = sorted(out["modes"], key=mode_area, reverse=True)
+        rates = out["modes"].get(out["res"] or "", [])
+
+        def change(kind):
+            def fn(d):
+                if kind == "res":
+                    new = self.cycle(modes, out["res"], d)
+                    if new:
+                        r = out["modes"][new]
+                        self.try_display(out, mode=new, rate=r[0] if r else None)
+                elif kind == "rate":
+                    new = self.cycle(rates, out["rate"], d)
+                    if new:
+                        self.try_display(out, mode=out["res"], rate=new)
+                elif kind == "rot":
+                    names = [k for k, _v in ROTATIONS]
+                    new = self.cycle(names, out["rotation"], d)
+                    self.try_display(out, rotate=new)
+                elif kind == "bright":
+                    b = min(max(bright + (0.1 if d >= 0 else -0.1), 0.3), 1.3)
+                    xrandr_apply(out["name"], brightness=b)
+                    save_settings({"display": {"output": out["name"], "brightness": round(b, 2)}})
+                elif kind == "auto":
+                    xrandr_apply(out["name"], auto=True, rotate="normal", brightness=1.0)
+                    save_settings({"display": {"output": out["name"], "mode": None, "rate": None,
+                                               "rotate": "normal", "brightness": 1.0}})
+            return fn
+
+        rot_names = dict(ROTATIONS)
+        return [
+            self.info_row("Salida", out["name"]),
+            {"label": "Resolución", "value": out["res"] or "?", "arrows": True,
+             "fn": change("res")},
+            {"label": "Frecuencia", "value": "%s Hz" % (out["rate"] or "?"), "arrows": True,
+             "fn": change("rate")},
+            {"label": "Rotación", "value": rot_names.get(out["rotation"], out["rotation"]),
+             "arrows": True, "fn": change("rot")},
+            {"label": "Brillo", "value": "%d %%" % round(bright * 100), "arrows": True,
+             "fn": change("bright")},
+            {"label": "Restablecer (automático)", "value": "", "fn":
+             lambda d: change("auto")(d) if d == 0 else None},
+        ]
+
+    def try_display(self, out, mode=None, rate=None, rotate=None):
+        old = {"output": out["name"], "mode": out["res"], "rate": out["rate"],
+               "rotate": out["rotation"]}
+        if not xrandr_apply(out["name"], mode=mode, rate=rate, rotate=rotate):
+            xrandr_apply(out["name"], mode=old["mode"], rate=old["rate"], rotate=old["rotate"])
+            return
+        new = {"output": out["name"], "mode": mode or out["res"],
+               "rate": rate if mode else out["rate"], "rotate": rotate or out["rotation"]}
+        self.pending = {"old": old, "new": new, "deadline": time.time() + 10}
+        self.push("¿Mantener esta pantalla?", self.page_confirm)
+        self.tick_id = GLib.timeout_add(1000, self.tick)
+
+    def page_confirm(self):
+        left = max(int(self.pending["deadline"] - time.time()), 0) if self.pending else 0
+        return [self.info_row("Se volverá a la configuración anterior en", "%d s" % left),
+                {"label": "Mantener esta configuración", "value": "", "fn": self.keep_display},
+                {"label": "Volver a la anterior", "value": "", "fn": self.cancel_display}]
+
+    @guarded
+    def tick(self):
+        if not self.pending:
+            self.tick_id = 0
+            return False
+        if time.time() >= self.pending["deadline"]:
+            self.cancel_display(0)
+            self.tick_id = 0
+            return False
+        if self.get_visible() and self.stack[-1][1] == self.page_confirm:
+            self.refresh()
+        return True
+
+    def keep_display(self, _d):
+        if self.pending:
+            save_settings({"display": self.pending["new"]})
+            self.pending = None
+        self.pop()
+
+    def cancel_display(self, _d):
+        self.revert_display()
+        if self.stack and self.stack[-1][1] == self.page_confirm:
+            self.pop()
+
+    def revert_display(self):
+        if self.pending:
+            old = self.pending["old"]
+            xrandr_apply(old["output"], mode=old["mode"], rate=old["rate"], rotate=old["rotate"])
+            self.pending = None
+
+    # sonido
+    def page_sound(self):
+        if not shutil.which("pactl"):
+            return [self.info_row("Sonido", "pactl no está instalado")]
+        sinks, default = audio_sinks()
+        names = [s["name"] for s in sinks]
+        desc = {s["name"]: s["desc"] or s["name"] for s in sinks}
+        vol, muted = audio_volume(), audio_muted()
+
+        def fvol(d):
+            audio_set_volume(min(max(audio_volume() + (5 if d >= 0 else -5), 0), 100))
+
+        def fmute(_d):
+            audio_set_mute(not audio_muted())
+
+        def fout(d):
+            new = self.cycle(names, default, d)
+            if new:
+                audio_set_default(new)
+
+        return [{"label": "Volumen", "value": "%d %%" % vol, "arrows": True, "fn": fvol},
+                {"label": "Silenciar", "value": "sí" if muted else "no", "arrows": True,
+                 "fn": fmute},
+                {"label": "Salida de audio", "value": desc.get(default, default or "?"),
+                 "arrows": True, "fn": fout}]
+
+    # red
+    def page_network(self):
+        net = self.tv.net
+        if net.get("ethernet"):
+            state = "cable conectado"
+        elif net.get("wifi"):
+            state = "Wi-Fi: %s" % net["wifi"]
+        else:
+            state = "sin conexión"
+        ips = run(["hostname", "-I"], 4)[1].split()
+        on = wifi_radio_enabled() if shutil.which("nmcli") else False
+
+        def fradio(_d):
+            run(["nmcli", "radio", "wifi", "off" if on else "on"], 8)
+
+        def fopen(d):
+            if d == 0:
+                self.close_menu()
+                self.tv.show_page("wifi")
+        return [self.info_row("Estado", state),
+                self.info_row("Dirección IP", ips[0] if ips else "—"),
+                {"label": "Wi-Fi", "value": "activado" if on else "desactivado",
+                 "arrows": True, "fn": fradio},
+                {"label": "Buscar y conectar a una red Wi-Fi", "value": "", "fn": fopen}]
+
+    # teclado
+    def page_keyboard(self):
+        current = keyboard_current()
+        codes = [c for c, _n in KEYBOARD_LAYOUTS]
+        names = dict(KEYBOARD_LAYOUTS)
+
+        def fkb(d):
+            new = self.cycle(codes, current, d)
+            if new and keyboard_set(new):
+                save_settings({"keyboard": new})
+        return [{"label": "Distribución del teclado", "value": names.get(current, current or "?"),
+                 "arrows": True, "fn": fkb}]
+
+    # zona horaria
+    def page_timezone(self):
+        current = timezone_current()
+        zones = list(TIMEZONES)
+        if current and current not in zones:
+            zones.insert(0, current)
+
+        def ftz(d):
+            new = self.cycle(zones, current, d)
+            if not new:
+                return
+            if run(["timedatectl", "set-timezone", new], 10)[0] != 0:
+                run(["sudo", "-n", "timedatectl", "set-timezone", new], 10)
+        return [{"label": "Zona horaria", "value": current or "?", "arrows": True, "fn": ftz},
+                self.info_row("Hora actual", time.strftime("%H:%M"))]
+
+    # almacenamiento
+    def page_storage(self):
+        parts = removable_partitions()
+        if not parts:
+            return [self.info_row("USB", "no hay memorias conectadas")]
+        rows = []
+        for p in parts:
+            def eject(d, part=p):
+                if d == 0:
+                    run(["udisksctl", "unmount", "-b", part["path"]], 20)
+                    run(["udisksctl", "power-off", "-b", part["disk"]], 20)
+            rows.append({"label": "Expulsar %s" % p["label"], "value": p["size"], "fn": eject})
+        return rows
+
+    # aplicación abierta
+    def page_app(self):
+        def fclose(d):
+            if d == 0:
+                self.close_menu()
+                self.tv.close_apps()
+
+        def fhome(d):
+            if d == 0:
+                self.close_menu()
+                self.tv.close_apps()
+                self.tv.history.clear()
+                self.tv.show_page("home", push=False)
+        return [{"label": "Cerrar la aplicación", "value": "", "fn": fclose},
+                {"label": "Volver al menú de TV (cerrando la aplicación)", "value": "",
+                 "fn": fhome}]
+
+    # energía
+    def page_power(self):
+        def danger(key, text, action):
+            def fn(d):
+                if d != 0:
+                    return
+                if self.armed != key:
+                    self.armed = key
+                    return
+                action()
+            label = text if self.armed != key else "¿Seguro? Pulsa Enter otra vez"
+            return {"label": label, "value": "", "fn": fn}
+
+        def restart_ui():
+            self.tv.exit_code = 0
+            self.close_menu()
+            self.tv.quit_ui()
+
+        def desktop():
+            self.tv.exit_code = EXIT_DESKTOP
+            self.close_menu()
+            self.tv.quit_ui()
+        return [danger("ui", "Reiniciar la interfaz de TV", restart_ui),
+                danger("xfce", "Ir al escritorio XFCE", desktop),
+                danger("reboot", "Reiniciar el equipo",
+                       lambda: run(["systemctl", "reboot"], 10)),
+                danger("off", "Apagar el equipo",
+                       lambda: run(["systemctl", "poweroff"], 10))]
+
+
+# ---------------------------------------------------------------------------
 # Ventana principal
 # ---------------------------------------------------------------------------
 class LibianTV(Gtk.Window):
@@ -603,6 +1453,8 @@ class LibianTV(Gtk.Window):
         self.app = None
         self.app_started = 0.0
         self.bar = None
+        self.procs = []
+        self.menu = None
         self.cpu = CpuMeter()
         self.net = {"has_wifi": False, "wifi": None, "ethernet": False, "signal": 0, "dev": None}
         self.net_busy = False
@@ -677,6 +1529,7 @@ class LibianTV(Gtk.Window):
         self.update_sys()
         self.show_page("home", push=False)
         GLib.timeout_add(1500, lambda: (self.poll_net(), False)[1])
+        self.menu = SystemMenu(self)
 
     # -- piezas de la pantalla -----------------------------------------------
     def build_header(self):
@@ -1322,10 +2175,16 @@ class LibianTV(Gtk.Window):
             self.message("No se pudo abrir la aplicación",
                          "No está instalado: %s" % args[0])
             return None
+        before = list(wm_windows()) if shutil.which("wmctrl") else []
         try:
-            return subprocess.Popen(args, stdin=subprocess.DEVNULL,
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True)
+            self.procs = [p for p in self.procs if p.poll() is None] + [proc]
+            if shutil.which("wmctrl") and args[0] not in ("wpctl", "systemctl", "pactl"):
+                threading.Thread(target=fullscreen_new_windows, args=(before,),
+                                 daemon=True).start()
+            return proc
         except OSError as exc:
             self.message("No se pudo abrir la aplicación", str(exc))
             return None
@@ -1364,6 +2223,7 @@ class LibianTV(Gtk.Window):
 
     def finish_app(self):
         self.app = None
+        self.procs = [p for p in self.procs if p.poll() is None]
         if self.bar is not None:
             self.bar.close_bar()
             self.bar = None
@@ -1373,31 +2233,70 @@ class LibianTV(Gtk.Window):
             pass
         self.present()
 
+    def apps_running(self):
+        alive = [p for p in self.procs if p.poll() is None]
+        if self.app is not None and self.app.poll() is None and self.app not in alive:
+            alive.append(self.app)
+        return alive
+
     def close_app(self):
-        proc = self.app
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        self.close_apps()
+
+    def close_apps(self):
+        """Cierra la app administrada y cualquier otra abierta desde el menú de TV."""
+        procs = self.apps_running()
+        for proc in procs:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
         deadline = time.time() + 3
-        while time.time() < deadline and proc.poll() is None:
+        while time.time() < deadline and any(p.poll() is None for p in procs):
             while Gtk.events_pending():
                 Gtk.main_iteration()
             time.sleep(0.05)
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        self.procs = []
         self.finish_app()
+
+    # -- menú de sistema y atajos globales ------------------------------------------
+    def toggle_menu(self):
+        if self.menu is None:
+            return
+        if self.menu.is_open():
+            self.menu.close_menu()
+        else:
+            self.menu.open_menu()
+
+    def menu_closed(self):
+        if not self.apps_running():
+            self.present()
+
+    def quit_ui(self):
+        Gtk.main_quit()
+
+    @guarded
+    def on_hotkey(self, event):
+        if event == "ctrlalt":
+            self.toggle_menu()
+        elif event == "escape5":
+            if self.menu is not None and self.menu.is_open():
+                return False
+            if self.apps_running():
+                self.announce("Cerrando la aplicación…")
+                self.close_apps()
+        return False
 
     @guarded
     def bar_action(self, action):
         if action == "close":
             self.announce("Cerrando…")
-            GLib.idle_add(self.close_app)
+            GLib.idle_add(self.close_apps)
             return
         keys = {"back": "alt+Left", "forward": "alt+Right", "reload": "F5",
                 "zoom_in": "ctrl+plus", "zoom_out": "ctrl+minus"}
@@ -1413,7 +2312,7 @@ class LibianTV(Gtk.Window):
 
     def set_status_idle(self):
         self.status.set_text("LIBIAN TV  ·  Flechas y Enter para moverte  ·  "
-                             "Esc para volver  ·  Ctrl+Alt+Q cierra la app abierta")
+                             "Esc para volver  ·  Ctrl+Alt: ajustes  ·  Esc ×5: cerrar la app")
         return False
 
     @guarded
@@ -1449,14 +2348,30 @@ class LibianTV(Gtk.Window):
         return answer == Gtk.ResponseType.YES
 
     def on_destroy(self, _window):
-        if self.app is not None and self.app.poll() is None:
+        for proc in self.apps_running():
             try:
-                os.killpg(self.app.pid, signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)
             except OSError:
                 pass
+        try:
+            os.remove(LAUNCHER_PIDFILE)
+        except OSError:
+            pass
         Gtk.main_quit()
 
     # -- autoprueba (solo con el parámetro de arranque libian.autotest) ----------
+    def autotest_menu(self):
+        menu = self.menu
+        menu.open_menu()
+        for builder in (menu.page_main, menu.page_info, menu.page_display, menu.page_sound,
+                        menu.page_network, menu.page_keyboard, menu.page_timezone,
+                        menu.page_storage, menu.page_app, menu.page_power, menu.page_about):
+            menu.push("prueba", builder)
+            menu.on_key(None, type("E", (), {"keyval": Gdk.KEY_Down})())
+            menu.pop()
+        menu.close_menu()
+        assert not menu.is_open()
+
     def autotest(self):
         try:
             for name in list(self.titles):
@@ -1485,6 +2400,7 @@ class LibianTV(Gtk.Window):
             bar.close_bar()
             self.update_sys()
             self.update_sys()
+            self.autotest_menu()
             self.show_page("home", push=False)
             log("LIBIAN-TV-AUTOTEST-OK")
         except Exception:  # noqa: BLE001
@@ -1494,8 +2410,18 @@ class LibianTV(Gtk.Window):
 
 
 def main():
+    apply_saved_settings()
     win = LibianTV()
     win.show_all()
+    try:
+        with open(LAUNCHER_PIDFILE, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                         lambda: (win.on_hotkey("ctrlalt"), True)[1])
+    if shutil.which("xinput") and not cmdline_has("libian.autotest"):
+        KeyWatcher(lambda ev: GLib.idle_add(win.on_hotkey, ev)).start()
 
     def ready():
         log("LIBIAN-TV-READY")

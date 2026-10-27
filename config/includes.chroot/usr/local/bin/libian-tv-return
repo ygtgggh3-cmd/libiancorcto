@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""LIBIAN TV: «Volver al menú de TV» desde el escritorio XFCE.
+
+  libian-tv-return --button   botón flotante siempre visible (se inicia con XFCE)
+  libian-tv-return            vuelve ya a la interfaz de TV
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+
+def back_to_tv():
+    """Cierra la sesión de XFCE; libian-tv-session relanza entonces la interfaz de TV."""
+    if shutil.which("xfce4-session-logout"):
+        rc = subprocess.call(["xfce4-session-logout", "--logout", "--fast"])
+        if rc == 0:
+            return
+    subprocess.call(["pkill", "-u", str(os.getuid()), "-x", "xfce4-session"])
+
+
+def button():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+
+    css = Gtk.CssProvider()
+    css.load_from_data(b"""
+        window { background-color: #1f5fe0; border-radius: 10px; border: 2px solid #ffffff; }
+        button { background-image: none; background-color: #1f5fe0; color: #ffffff;
+                 font-weight: bold; font-size: 15px; padding: 8px 14px; border: none; }
+        button:hover { background-color: #3d78f0; }""")
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win = Gtk.Window(title="Volver al menú de TV")
+    win.set_decorated(False)
+    win.set_keep_above(True)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_accept_focus(False)
+    win.stick()
+    btn = Gtk.Button(label="📺  Volver al menú de TV")
+    btn.connect("clicked", lambda _b: back_to_tv())
+    win.add(btn)
+    win.show_all()
+    width = win.get_size()[0]
+    win.move(max(Gdk.Screen.get_default().get_width() - width - 14, 0), 14)
+
+    def raise_it():
+        gdkwin = win.get_window()
+        if gdkwin is not None:
+            gdkwin.raise_()
+        return True
+    GLib.timeout_add(1500, raise_it)
+    win.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if "--button" in sys.argv[1:]:
+        button()
+    else:
+        back_to_tv()

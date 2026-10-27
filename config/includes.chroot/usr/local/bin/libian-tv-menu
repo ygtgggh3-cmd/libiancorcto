@@ -1,0 +1,6 @@
+#!/bin/sh
+# Abre/cierra el menú de ajustes de LIBIAN TV (le envía una señal a la interfaz).
+pidfile="${XDG_RUNTIME_DIR:-/tmp}/libian-tv.pid"
+[ -r "$pidfile" ] || exit 1
+pid=$(cat "$pidfile" 2>/dev/null)
+[ -n "$pid" ] && kill -USR1 "$pid" 2>/dev/null

@@ -37,6 +37,11 @@ Si la prueba de arranque falla, la ISO igualmente se publica (es estructuralment
 - Idioma `es_PE.UTF-8`, teclado `latam`, zona `America/Lima` (se cambian en `auto/config`).
 - Firmware no libre (Wi-Fi Intel/Atheros/Broadcom/Realtek, Radeon, microcódigo) desde `non-free-firmware`.
 
+- **Menú de ajustes estilo Batocera (v1.1)**: pulsa **Ctrl+Alt** (solas) en cualquier momento, incluso con una app abierta (también **Ctrl+Alt+M** o la tecla *Menú*). Incluye información del sistema, pantalla (resolución, frecuencia, rotación y brillo, con confirmación de 10 s que revierte sola), sonido (volumen, silencio, salida), red/Wi-Fi, teclado, zona horaria, expulsar USB, la app abierta y energía. Sin opciones de juegos.
+- **Pantalla completa**: las apps que abres desde el menú pasan a pantalla completa; YouTube TV (VacuumTube) arranca en modo pantalla completa.
+- **Salir de una app**: pulsa **Esc cinco veces** seguidas (o Ctrl+Alt+Q) y vuelves al menú de TV.
+- **Desde el escritorio XFCE**: botón flotante **📺 Volver al menú de TV** (arriba a la derecha), icono en el escritorio y entrada en el menú de aplicaciones; cerrar sesión en XFCE también regresa a la TV.
+
 ## Limitaciones conocidas
 - Kernel 64 bits: sirve para CPU de 2008 con soporte x86-64 (Core 2, Phenom, etc.), no para Pentium 4 de 32 bits.
 - VacuumTube es un proyecto de terceros no oficial; es una app Electron y consume bastante RAM. Para PC antiguas, la primera vez que se abre se crea `~/.config/VacuumTube/config.json` con ajustes ligeros: solo video H.264 (sin VP9/AV1), modo de poca memoria, sin DIAL ni actualizaciones automáticas. Se pueden cambiar con `Ctrl+O`. En Firefox se desactivan VP9/AV1 con el mismo fin.
