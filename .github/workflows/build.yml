@@ -132,6 +132,8 @@ jobs:
             if ! grep -q 'LIBIAN-TV-AUTOTEST-OK' smoke/serial.log; then
               tailmsg=$(grep -v '^\s*$' smoke/serial.log | tail -n 45 | cut -c1-220 | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
               echo "::warning title=Final del log serie (diagnostico)::${tailmsg}"
+              lcmsg=$(grep -i -E 'live-config|live-boot|user-setup|adduser|useradd|Failed|FAILED' smoke/serial.log | head -n 30 | cut -c1-220 | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+              echo "::warning title=Log serie: live-config y fallos::${lcmsg:-nada}"
             fi
           fi
 

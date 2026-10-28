@@ -72,6 +72,14 @@ efibootmgr
 os-prober
 
 # Dependencias que antes llegaban como «recomendados» (ahora se instalan sin ellos para ahorrar espacio)
+# Sistema live: usuario automático, expulsar, uuid (live-config los recomienda)
+live-config
+live-config-systemd
+user-setup
+adduser
+eject
+uuid-runtime
+tzdata
 wpasupplicant
 libgl1-mesa-dri
 librsvg2-common

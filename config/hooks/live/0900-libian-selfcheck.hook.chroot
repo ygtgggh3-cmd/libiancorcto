@@ -21,6 +21,9 @@ for bin in xfwm4 xfsettingsd startxfce4 lightdm firefox-esr mpv thunar xfce4-ter
     command -v "$bin" >/dev/null 2>&1 || fail "falta el programa: $bin"
 done
 
+for pkg in live-boot live-config user-setup adduser; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || fail "falta el paquete $pkg (sin él no se crea el usuario live)"
+done
 python3 -m py_compile /usr/local/bin/libian-tv || fail "libian-tv no compila"
 python3 -c "import gi; gi.require_version('Gtk','3.0'); gi.require_version('GdkPixbuf','2.0'); from gi.repository import Gtk, Gdk, GdkPixbuf, GLib; import cairo" \
     || fail "python3-gi / GTK 3 no se pueden importar"
