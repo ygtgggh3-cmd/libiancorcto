@@ -34,6 +34,15 @@ if [ "$build_rc" -ne 0 ]; then
 fi
 
 mkdir -p output
+# Informe de tamaños (para saber qué pesa más)
+{
+  echo "Instalado en la imagen (descomprimido): $(du -sh chroot 2>/dev/null | cut -f1)"
+  echo "Paquetes mas grandes (MB instalado):"
+  dpkg-query --admindir=chroot/var/lib/dpkg -W -f='${Installed-Size}\t${Package}\n' 2>/dev/null \
+    | sort -rn | head -22 | awk '{printf "%s=%d  ", $2, $1/1024}'
+  echo
+} > output/sizes.txt 2>&1 || true
+cat output/sizes.txt
 iso=$(find . -maxdepth 1 -type f -name '*.iso' | head -n1)
 [ -n "$iso" ] || { echo "ERROR: lb build no generó ninguna ISO"; exit 1; }
 cp -v "$iso" output/libian-tv-amd64.iso

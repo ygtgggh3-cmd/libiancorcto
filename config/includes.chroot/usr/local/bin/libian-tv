@@ -774,8 +774,7 @@ PAGES = {
     ]),
     "usb": ("USB, videos y música", [
         ("▤", "Explorar USB", "Abrir memorias y discos", "green", ("usb",), "thunar"),
-        ("▶", "Reproductor VLC", "Videos y música", "orange", ("cmd", ["vlc"]), "vlc"),
-        ("▶", "Reproductor MPV", "Ligero y rápido", "blue",
+        ("▶", "Reproductor", "Videos y música (MPV)", "blue",
          ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
         ("▦", "Mis videos", "Carpeta Videos", "slate",
          ("cmd", ["thunar", os.path.expanduser("~/Videos")]), "thunar"),
@@ -783,16 +782,13 @@ PAGES = {
     "games": ("Juegos", [
         ("♠", "Solitarios", "AisleRiot, +80 juegos de cartas", "green",
          ("cmd", ["sol"]), "sol"),
-        ("♣", "PySolFC", "Colección de solitarios", "blue",
-         ("cmd", ["pysolfc"]), "pysolfc"),
-        ("♞", "SuperTux", "Plataformas estilo Mario", "orange",
-         ("cmd", ["supertux2"]), "supertux2"),
     ]),
     "apps": ("Aplicaciones", [
         ("◎", "Navegador web", "Firefox con barra para cerrar", "orange",
          ("web", "about:home"), "firefox-esr"),
         ("▤", "Archivos", "Administrador de archivos", "green", ("cmd", ["thunar"]), "thunar"),
-        ("▶", "Reproductor", "VLC", "blue", ("cmd", ["vlc"]), "vlc"),
+        ("▶", "Reproductor", "MPV", "blue",
+         ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
         ("▣", "Terminal", "Línea de comandos", "slate",
          ("cmd", ["xfce4-terminal"]), "xfce4-terminal"),
         ("⬇", "Instalar LIBIAN TV", "Instalar en el disco duro", "red",
@@ -821,7 +817,6 @@ PAGES = {
 # Fila "Mis aplicaciones": (iconos posibles, glifo, título, acción, requerido)
 APP_ROW = [
     (["firefox-esr", "firefox"], "◎", "Navegador", ("web", "about:home"), "firefox-esr"),
-    (["vlc"], "▶", "VLC", ("cmd", ["vlc"]), "vlc"),
     (["mpv"], "▶", "MPV", ("cmd", ["mpv", "--player-operation-mode=pseudo-gui"]), "mpv"),
     (["org.xfce.terminal", "utilities-terminal"], "▣", "Terminal",
      ("cmd", ["xfce4-terminal"]), "xfce4-terminal"),

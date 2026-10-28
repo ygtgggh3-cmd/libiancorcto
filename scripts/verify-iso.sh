@@ -32,7 +32,7 @@ bsdtar -xf "$ISO" -C "$WORK" live/filesystem.squashfs
 unsquashfs -l "$WORK/live/filesystem.squashfs" > "$WORK/sq.txt"
 for f in usr/local/bin/libian-tv usr/local/bin/libian-tv-session usr/share/xsessions/libian-tv.desktop \
          etc/lightdm/lightdm.conf.d/50-libian.conf etc/systemd/system/libian-autologin.service \
-         usr/sbin/lightdm usr/bin/firefox-esr usr/bin/vlc usr/bin/mpv usr/bin/thunar \
+         usr/sbin/lightdm usr/bin/firefox-esr usr/bin/mpv usr/bin/thunar \
          usr/bin/xfce4-terminal usr/bin/xfwm4 usr/bin/calamares usr/bin/python3; do
     grep -Fxq "squashfs-root/$f" "$WORK/sq.txt" && ok "sistema contiene /$f" || bad "sistema NO contiene /$f"
 done

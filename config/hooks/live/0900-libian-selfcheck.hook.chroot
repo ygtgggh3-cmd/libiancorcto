@@ -16,7 +16,7 @@ done
 for f in /usr/local/bin/libian-tv /usr/local/bin/libian-tv-session /usr/local/bin/libian-tv-close /usr/local/bin/libian-tv-menu /usr/local/bin/libian-tv-return /usr/local/lib/libian/autologin.sh; do
     [ -x "$f" ] || fail "$f no es ejecutable"
 done
-for bin in xfwm4 xfsettingsd startxfce4 lightdm firefox-esr vlc thunar xfce4-terminal \
+for bin in xfwm4 xfsettingsd startxfce4 lightdm firefox-esr mpv thunar xfce4-terminal \
            xterm calamares xset xsetroot logger xdotool xbindkeys nmcli wpctl wmctrl xinput stdbuf pactl xrandr setxkbmap lsblk; do
     command -v "$bin" >/dev/null 2>&1 || fail "falta el programa: $bin"
 done

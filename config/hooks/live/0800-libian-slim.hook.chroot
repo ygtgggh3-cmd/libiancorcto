@@ -1,0 +1,19 @@
+#!/bin/sh
+# Adelgaza la imagen: quita documentación, páginas man y traducciones que no se usan.
+# (Se conservan los archivos copyright y los idiomas es/en.)
+set -e
+find /usr/share/doc -type f ! -name copyright -delete 2>/dev/null || true
+find /usr/share/doc -type l -delete 2>/dev/null || true
+find /usr/share/doc -type d -empty -delete 2>/dev/null || true
+rm -rf /usr/share/man/* /usr/share/info/* /usr/share/help/* /usr/share/gtk-doc 2>/dev/null || true
+for d in /usr/share/locale/*; do
+    [ -d "$d" ] || continue
+    case "$(basename "$d")" in
+        es|es_*|en|en_*|locale.alias) ;;
+        *) rm -rf "$d" ;;
+    esac
+done
+apt-get clean 2>/dev/null || true
+rm -rf /var/cache/apt/* /var/lib/apt/lists/* /var/cache/debconf/*-old /var/log/*.log 2>/dev/null || true
+find /usr -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+echo "SLIM OK"

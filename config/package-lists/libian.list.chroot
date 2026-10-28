@@ -40,7 +40,6 @@ adwaita-icon-theme
 
 # Navegador y multimedia
 firefox-esr
-vlc
 mpv
 
 # Control desde el menú (cerrar/atrás/recargar en el navegador, atajos globales)
@@ -71,6 +70,18 @@ grub-pc
 grub-efi-amd64-bin
 efibootmgr
 os-prober
+
+# Dependencias que antes llegaban como «recomendados» (ahora se instalan sin ellos para ahorrar espacio)
+wpasupplicant
+libgl1-mesa-dri
+librsvg2-common
+xdg-utils
+xdg-user-dirs
+rsync
+squashfs-tools
+dosfstools
+parted
+e2fsprogs
 
 # Utilidades
 nano

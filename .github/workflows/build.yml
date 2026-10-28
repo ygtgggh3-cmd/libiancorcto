@@ -77,6 +77,15 @@ jobs:
             echo "::warning::$(printf '%s' "$l" | sed -e 's/%/%25/g' | cut -c1-400)"
           done
 
+      - name: Report sizes (readable in annotations)
+        if: always()
+        run: |
+          if [ -f output/sizes.txt ]; then
+            msg=$(tr -d '\r' < output/sizes.txt | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::notice title=Tamaños::${msg}"
+          fi
+          ls -l output/*.iso 2>/dev/null | awk '{printf "::notice title=ISO bytes::%s MB\n", $5/1048576}'
+
       - name: Show ISO
         run: |
           ls -lh output/

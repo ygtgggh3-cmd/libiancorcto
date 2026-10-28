@@ -21,7 +21,7 @@ lb config noauto \
     --debian-installer none \
     --memtest none \
     --apt-indices false \
-    --apt-recommends true \
+    --apt-recommends false \
     --chroot-squashfs-compression-type xz \
     --image-name libian-tv \
     --iso-application "LIBIAN TV" \

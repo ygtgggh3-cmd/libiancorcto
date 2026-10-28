@@ -15,7 +15,6 @@ hunspell-es
 
 # Firmware para equipos antiguos (Wi-Fi, red, gráficos Radeon, microcódigo)
 firmware-linux-free
-firmware-misc-nonfree
 firmware-realtek
 firmware-atheros
 firmware-iwlwifi
@@ -26,8 +25,6 @@ amd64-microcode
 
 # Juegos ligeros
 aisleriot
-pysolfc
-supertux
 
 # YouTube ligero desde mpv/terminal
 yt-dlp
