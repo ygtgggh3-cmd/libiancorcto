@@ -21,6 +21,18 @@ scripts/preflight.sh
 
 lb clean --purge >/dev/null 2>&1 || true
 lb config
+# Compresión squashfs más fuerte (bloques de 1 MB + filtro x86): ~5-8 % menos de ISO.
+if command -v mksquashfs >/dev/null 2>&1; then
+    real_mksquashfs=$(command -v mksquashfs)
+    cat > /usr/local/bin/mksquashfs <<SHIM
+#!/bin/sh
+case " \$* " in
+  *" xz "*) exec $real_mksquashfs "\$@" -b 1048576 -Xdict-size 100% -Xbcj x86 ;;
+  *) exec $real_mksquashfs "\$@" ;;
+esac
+SHIM
+    chmod +x /usr/local/bin/mksquashfs
+fi
 scripts/fetch-vacuumtube.sh
 echo "== lb config =="; cat config/common 2>/dev/null | head -60 || true
 

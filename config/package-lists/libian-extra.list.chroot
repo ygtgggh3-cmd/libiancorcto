@@ -16,7 +16,6 @@ hunspell-es
 # Firmware para equipos antiguos (Wi-Fi, red, gráficos Radeon, microcódigo)
 firmware-linux-free
 firmware-realtek
-firmware-atheros
 firmware-iwlwifi
 firmware-brcm80211
 firmware-amd-graphics

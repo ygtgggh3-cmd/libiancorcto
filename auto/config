@@ -18,7 +18,7 @@ lb config noauto \
     --backports false \
     --binary-images iso-hybrid \
     --linux-flavours amd64 \
-    --debian-installer none \
+    --debian-installer none --firmware-chroot false --firmware-binary false \
     --memtest none \
     --apt-indices false \
     --apt-recommends false \

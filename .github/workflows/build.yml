@@ -129,6 +129,10 @@ jobs:
           if [ -f smoke/serial.log ]; then
             msg=$(grep -E 'LIBIAN-TV|libian-tv-session' smoke/serial.log | tail -n 15 | cut -c1-500 | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::notice title=Prueba de arranque (marcas LIBIAN TV)::${msg:-sin marcas}"
+            if ! grep -q 'LIBIAN-TV-AUTOTEST-OK' smoke/serial.log; then
+              tailmsg=$(grep -v '^\s*$' smoke/serial.log | tail -n 45 | cut -c1-220 | tr -d '\r' | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+              echo "::warning title=Final del log serie (diagnostico)::${tailmsg}"
+            fi
           fi
 
       - name: Upload smoke-test evidence
